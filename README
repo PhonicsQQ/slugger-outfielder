@@ -1,0 +1,6 @@
+SLUGGER Outfield Positioning Optimizer
+Overview
+
+The SLUGGER Outfield Positioning Optimizer is a web-based analytics tool designed to compute and visualize optimal defensive outfield positioning in baseball using historical batted-ball data. Developed in collaboration with the SLUGGER platform team, the project translates Trackman-derived spray data into actionable positioning recommendations for left field, center field, and right field.
+
+While offensive analytics have become widely accessible, defensive positioning tools remain largely proprietary. This project aims to bridge that gap by formalizing outfield defense as a quantifiable optimization problem and deploying it as an interactive, research-oriented web application.
