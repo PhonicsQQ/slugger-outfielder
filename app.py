@@ -80,7 +80,7 @@ def generate_spray(batter_id: str, pitcher_hand: str) -> pd.DataFrame:
     seed = abs(hash(batter_id + "_" + pitcher_hand)) % (2**32)
     rng = np.random.default_rng(seed)
     n = 180
-
+    
     # Bias direction of spray based on matchup
     if bhand == "L" and pitcher_hand == "RHP":
         x = rng.normal(210, 25, n)  # pull to RF

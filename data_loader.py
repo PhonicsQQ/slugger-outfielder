@@ -279,8 +279,9 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
     # ---------------------------------------------------
 
     # Remove home runs
+    VALID_OUTCOMES = ["OUT", "SINGLE", "DOUBLE"]
     if "outcome" in df.columns:
-        df = df[df["outcome"] != "HOMERUN"]
+        df = df[df["outcome"].isin(VALID_OUTCOMES)]
 
     # Remove ground balls (launch_angle <= 10 degrees)
     if "angle" in df.columns:
@@ -294,6 +295,9 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
         if len(df) > 0:
             threshold = df["y"].quantile(0.7)
             df = df[df["y"] >= threshold]
+    
+    if "y" in df.columns:
+        df = df[df["y"] >= 200]
 
     return df
 
