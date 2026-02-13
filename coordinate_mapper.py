@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Phase 2: MLB Coordinate → Logical Coordinate Transformation Mapping
+Phase 2: MLB Coordinate â†’ Logical Coordinate Transformation Mapping
 
 This module provides functions to map real MLB batted ball coordinates
 into the logical coordinate space used by the Excel optimizer.
@@ -23,18 +23,20 @@ EXCEL_GRID_PARAMS = {
     "LF": {"min_x": 40, "max_x": 70, "min_y": 80, "max_y": 110}
 }
 
-# Excel grid “center points” (in logical coordinates)
+# Excel grid â€œcenter pointsâ€ (in logical coordinates)
 EXCEL_CENTERS = {
     "LF": (55.0, 95.0),   # (min_x + max_x)/2, (min_y + max_y)/2
     "CF": (125.0, 75.0),
     "RF": (190.0, 95.0)
 }
 
-# Fixed logical label coordinates for LF/CF/RF (used as reference mapping points)
+# Fixed logical coordinates for LF/CF/RF mapping targets
+# These are the centroids of the LF/CF/RF regions within the outfield polygon
+# (from outfield_region_config.json), NOT the label positions which sit outside the polygon.
 IMAGE_LABELS_LOGICAL = {
-    "LF": (-60.0, 20.0),
-    "CF": (-20.0, 25.0),
-    "RF": (20.0, 20.0)
+    "LF": (-67.0, -29.0),
+    "CF": (-15.0, -24.0),
+    "RF": (33.0, -29.0)
 }
 
 

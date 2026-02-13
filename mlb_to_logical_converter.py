@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MLB Coordinate → Logical Coordinate Converter
+MLB Coordinate â†’ Logical Coordinate Converter
 
 Logical coordinate system definition:
     X range: -89.50 ~ 52.66
@@ -25,11 +25,14 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, List
 
-# Logical coordinate bounds
-LOGICAL_X_MIN = -89.50
-LOGICAL_X_MAX = 52.66
-LOGICAL_Y_MIN = -43.85
-LOGICAL_Y_MAX = -14.18
+# Logical coordinate bounds for visualization mapping
+# X bounds match the outfield polygon width
+# Y bounds cover the full visible outfield: from the fence (pixel ~750, logical ~32)
+# down to the infield edge (pixel ~1222, logical ~-14)
+LOGICAL_X_MIN = -100.00
+LOGICAL_X_MAX = 63.00
+LOGICAL_Y_MIN = 5.00
+LOGICAL_Y_MAX = 50.00
 
 # Logical reference points (fixed)
 LOGICAL_LF = (-60.0, 20.0)
@@ -54,7 +57,7 @@ def mlb_to_logical_simple_scale(
         mlb_y_range: Tuple (min_y, max_y) of MLB y-values
 
     Returns:
-        (logical_x, logical_y) — clamped within logical coordinate limits.
+        (logical_x, logical_y) â€” clamped within logical coordinate limits.
     """
     mlb_x_min, mlb_x_max = mlb_x_range
     mlb_y_min, mlb_y_max = mlb_y_range

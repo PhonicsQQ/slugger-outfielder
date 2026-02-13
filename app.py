@@ -1,4 +1,4 @@
-# app.py — Outfield Positioning Optimizer Demo (drawn field)
+# app.py â€” Outfield Positioning Optimizer Demo (drawn field)
 # -*- coding: utf-8 -*-
 
 import io
@@ -68,30 +68,66 @@ LAST_CSV_PATH = "optimized_positions.csv"
 def generate_spray(batter_id: str, pitcher_hand: str) -> pd.DataFrame:
     """
     Generate synthetic spray data based on batter handedness and pitcher handedness.
-    Ensures the demo works even without real data.
+    Uses a mixture of clusters to create realistic spray patterns with gaps and variation.
     """
     if batter_id in BATTERS:
         meta = BATTERS[batter_id]
         bhand = meta["batter_hand"]
     else:
-        # Default to right-handed batter for unknown IDs
         bhand = "R"
 
     seed = abs(hash(batter_id + "_" + pitcher_hand)) % (2**32)
     rng = np.random.default_rng(seed)
-    n = 180
-    
-    # Bias direction of spray based on matchup
-    if bhand == "L" and pitcher_hand == "RHP":
-        x = rng.normal(210, 25, n)  # pull to RF
-    elif bhand == "L" and pitcher_hand == "LHP":
-        x = rng.normal(150, 25, n)  # more middle
-    elif bhand == "R" and pitcher_hand == "LHP":
-        x = rng.normal(90, 25, n)   # pull to LF
-    else:  # R vs RHP
-        x = rng.normal(150, 25, n)
+    n = 150
 
-    y = rng.normal(310, 35, n)
+    # Create multiple spray clusters for realistic scatter
+    # Each cluster: (center_x, center_y, std_x, std_y, count)
+    if bhand == "L" and pitcher_hand == "RHP":
+        clusters = [
+            (200, 320, 30, 30, 45),   # pull side RF gap
+            (170, 290, 25, 35, 35),   # right-center
+            (150, 340, 20, 25, 25),   # straightaway CF deep
+            (120, 280, 30, 30, 25),   # left-center
+            (90, 310, 25, 25, 20),    # opposite field LF
+        ]
+    elif bhand == "L" and pitcher_hand == "LHP":
+        clusters = [
+            (150, 310, 35, 30, 40),   # center
+            (180, 290, 25, 35, 30),   # right-center
+            (110, 300, 30, 30, 30),   # left-center
+            (200, 330, 20, 20, 25),   # RF line
+            (80, 320, 20, 25, 25),    # LF line
+        ]
+    elif bhand == "R" and pitcher_hand == "LHP":
+        clusters = [
+            (100, 320, 30, 30, 45),   # pull side LF gap
+            (130, 290, 25, 35, 35),   # left-center
+            (150, 340, 20, 25, 25),   # straightaway CF deep
+            (180, 280, 30, 30, 25),   # right-center
+            (210, 310, 25, 25, 20),   # opposite field RF
+        ]
+    else:  # R vs RHP
+        clusters = [
+            (150, 310, 35, 30, 35),   # center
+            (120, 290, 25, 35, 30),   # left-center
+            (190, 300, 30, 30, 30),   # right-center
+            (100, 330, 20, 20, 25),   # LF line
+            (210, 320, 20, 25, 30),   # RF line
+        ]
+
+    all_x = []
+    all_y = []
+    for cx, cy, sx, sy, count in clusters:
+        all_x.append(rng.normal(cx, sx, count))
+        all_y.append(rng.normal(cy, sy, count))
+
+    x = np.concatenate(all_x)
+    y = np.concatenate(all_y)
+
+    # Shuffle to mix clusters
+    idx = rng.permutation(len(x))
+    x = x[idx][:n]
+    y = y[idx][:n]
 
     x = np.clip(x, 50, 250)
     y = np.clip(y, 230, 400)
@@ -129,6 +165,41 @@ def optimize_outfield(df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
                     best = {"LF": lf, "CF": cf, "RF": rf}
 
     return best
+
+
+def assign_distance_based_outcomes(df: pd.DataFrame, positions: Dict[str, Tuple[float, float]]) -> pd.DataFrame:
+    """
+    Assign realistic outcomes based on distance from each ball to the nearest fielder.
+    Balls close to fielders are outs, farther balls are singles, very far balls are doubles.
+    """
+    bx = df["x"].to_numpy()
+    by = df["y"].to_numpy()
+
+    # Calculate distance to nearest fielder
+    distances = []
+    for name, (fx, fy) in positions.items():
+        d = np.hypot(bx - fx, by - fy)
+        distances.append(d)
+    min_dist = np.minimum.reduce(distances)
+
+    # Assign outcomes based on distance thresholds
+    # Most outfield balls are caught - outs should dominate
+    p65 = np.percentile(min_dist, 65)
+    p90 = np.percentile(min_dist, 90)
+
+    outcomes = []
+    for d in min_dist:
+        if d <= p65:
+            outcomes.append("OUT")
+        elif d <= p90:
+            outcomes.append("SINGLE")
+        else:
+            outcomes.append("DOUBLE")
+    
+    df = df.copy()
+    df["outcome"] = outcomes
+    return df
+
 
 # -------------------------------------------------------
 # PLOTTING FUNCTION (drawn field visualization)
@@ -323,7 +394,11 @@ def make_plot_with_image(
     if outcome_col is None:
         outcome_col = "outcome"
         if "outcome" not in df.columns:
-            df["outcome"] = "OUT"
+            rng = np.random.default_rng(42)
+            df["outcome"] = rng.choice(
+                ["OUT", "SINGLE", "DOUBLE"],
+                size=len(df), p=[0.55, 0.30, 0.15]
+            )
 
     color_map = {
         "OUT": "#bdbdbd",
@@ -368,7 +443,7 @@ def make_plot_with_image(
         print(f"[OutfieldRegion] Failed to load region config (ignored): {e}")
 
     if not outfield_manager:
-        log.warning("OutfieldRegionManager unavailable — coordinate transforms disabled.")
+        log.warning("OutfieldRegionManager unavailable â€” coordinate transforms disabled.")
         return make_plot(df, positions, batter_label, pitcher_hand)
 
     # Image dimensions
@@ -390,19 +465,19 @@ def make_plot_with_image(
     ax.set_ylim(img_height, 0)  # Invert y-axis to match image coordinates
 
     # -------------------------------------------------------
-    # MLB → logical → pixel coordinate transformation for spray points
+    # MLB â†’ logical â†’ pixel coordinate transformation for spray points
     # -------------------------------------------------------
     balls_pixel = []
 
     if len(df) > 0:
-        from coordinate_mapper import MLBToLogicalMapper
+        from mlb_to_logical_converter import mlb_to_logical_simple_scale
 
         mlb_x_values = df["x"].dropna().tolist()
         mlb_y_values = df["y"].dropna().tolist()
 
         if mlb_x_values and mlb_y_values:
-            mapper = MLBToLogicalMapper()
-            mapper.fit_from_excel_grid(mlb_x_values, mlb_y_values)
+            mlb_x_range = (min(mlb_x_values), max(mlb_x_values))
+            mlb_y_range = (min(mlb_y_values), max(mlb_y_values))
 
             for idx, row in df.iterrows():
                 mlb_x = row["x"]
@@ -411,7 +486,9 @@ def make_plot_with_image(
                 if pd.isna(mlb_x) or pd.isna(mlb_y):
                     continue
 
-                logical_x, logical_y = mapper.transform_point(mlb_x, mlb_y)
+                logical_x, logical_y = mlb_to_logical_simple_scale(
+                    mlb_x, mlb_y, mlb_x_range, mlb_y_range
+                )
 
                 pixel_x, pixel_y = outfield_manager.logical_to_pixel(
                     (logical_x, logical_y)
@@ -421,56 +498,88 @@ def make_plot_with_image(
                 pixel_x = max(0, min(img_width - 1, pixel_x))
                 pixel_y = max(0, min(img_height - 1, pixel_y))
 
+                # Only keep dots in the outfield grass area
+                # Defined by: fence (top), infield dirt arc (bottom), foul lines (sides)
+                outfield_top = 750      # fence line
+                outfield_bottom = 900   # where outfield grass meets infield dirt
+                if pixel_y > outfield_bottom or pixel_y < outfield_top:
+                    continue
+
+                # Check dot is between the foul lines (fan/wedge from home plate)
+                # Home plate pixel: (1170, 1400)
+                # Left foul pole: (220, 850), Right foul pole: (2140, 854)
+                # Slightly wider than actual poles to allow dots near the lines
+                home_x, home_y = 1170, 1400
+                x_left = home_x + (pixel_y - home_y) * (220 - home_x) / (850 - home_y)
+                x_right = home_x + (pixel_y - home_y) * (2140 - home_x) / (854 - home_y)
+                if pixel_x < x_left or pixel_x > x_right:
+                    continue
+
                 color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
                 balls_pixel.append((pixel_x, pixel_y, color))
 
-        # Draw spray dots
-        for px, py, color in balls_pixel:
-            ax.scatter(
-                px,
-                py,
-                s=40,
-                c=color,
-                alpha=0.7,
-                edgecolor="white",
-                linewidth=0.5,
-                zorder=5,
-            )
-
     # -------------------------------------------------------
-    # Convert optimized positions to pixel coordinates
+    # Calculate optimized fielder positions from spray dot locations
+    # Place each fielder at the centroid of spray dots in their zone
     # -------------------------------------------------------
     optimized_pixel = {}
 
-    if positions is None:
-        try:
-            from optimizer import optimize_outfield_excel
-            from mlb_to_logical_converter import convert_dataframe_mlb_to_logical
-            from excel_grid_to_logical_converter import (
-                convert_optimizer_positions_to_logical,
-            )
+    if balls_pixel:
+        # Sort dots by pixel x to divide into LF/CF/RF thirds
+        sorted_dots = sorted(balls_pixel, key=lambda d: d[0])
+        n_dots = len(sorted_dots)
+        third = max(1, n_dots // 3)
 
-            df_logical = convert_dataframe_mlb_to_logical(df, mlb_x_col="x", mlb_y_col="y")
-            positions_excel_grid = optimize_outfield_excel(df_logical)
-            positions_logical = convert_optimizer_positions_to_logical(
-                positions_excel_grid
-            )
+        lf_dots = sorted_dots[:third]
+        cf_dots = sorted_dots[third:2*third]
+        rf_dots = sorted_dots[2*third:]
 
-            for name, (lx, ly) in positions_logical.items():
-                px, py = outfield_manager.logical_to_pixel((lx, ly))
-                px = max(0, min(img_width - 1, px))
-                py = max(0, min(img_height - 1, py))
-                optimized_pixel[name] = (px, py)
+        for name, dots in [("LF", lf_dots), ("CF", cf_dots), ("RF", rf_dots)]:
+            if dots:
+                avg_x = sum(d[0] for d in dots) / len(dots)
+                avg_y = sum(d[1] for d in dots) / len(dots)
+                optimized_pixel[name] = (avg_x, avg_y)
 
-        except Exception as e:
-            print(f"[Warning] Optimization failed: {e}")
-            optimized_pixel = {}
-    else:
-        for name, (lx, ly) in positions.items():
-            px, py = outfield_manager.logical_to_pixel((lx, ly))
-            px = max(0, min(img_width - 1, px))
-            py = max(0, min(img_height - 1, py))
-            optimized_pixel[name] = (px, py)
+    # -------------------------------------------------------
+    # Reassign outcomes based on pixel-space distance to nearest fielder
+    # Outs cluster around fielders, hits land in gaps
+    # -------------------------------------------------------
+    if balls_pixel and optimized_pixel:
+        fielder_positions = list(optimized_pixel.values())
+        min_dists = []
+
+        for (px, py, _) in balls_pixel:
+            d = min(np.hypot(px - fx, py - fy) for fx, fy in fielder_positions)
+            min_dists.append(d)
+
+        min_dists = np.array(min_dists)
+        p65 = np.percentile(min_dists, 65)
+        p90 = np.percentile(min_dists, 90)
+
+        outcome_colors = {
+            "OUT": "#bdbdbd",
+            "SINGLE": "#42a5f5",
+            "DOUBLE": "#66bb6a",
+        }
+
+        new_balls = []
+        for i, (px, py, _) in enumerate(balls_pixel):
+            if min_dists[i] <= p65:
+                outcome = "OUT"
+            elif min_dists[i] <= p90:
+                outcome = "SINGLE"
+            else:
+                outcome = "DOUBLE"
+            new_balls.append((px, py, outcome_colors[outcome]))
+
+        balls_pixel = new_balls
+
+    # Draw spray dots (after outcome reassignment)
+    for px, py, color in balls_pixel:
+        ax.scatter(
+            px, py, s=40, c=color, alpha=0.7,
+            edgecolor="white", linewidth=0.5, zorder=5,
+        )
 
     # -------------------------------------------------------
     # Draw optimized LF/CF/RF pixel markers
@@ -553,8 +662,8 @@ def make_plot_with_image(
 # - JSON loader is used during development when API is unavailable.
 #
 # Environment override:
-#   USE_API_MODE=true  → force API mode (ignore JSON loader)
-#   USE_API_MODE=false → use JSON loader if available (default)
+#   USE_API_MODE=true  â†’ force API mode (ignore JSON loader)
+#   USE_API_MODE=false â†’ use JSON loader if available (default)
 # -------------------------------------------------------
 
 USE_API_MODE_ENV = os.getenv("USE_API_MODE", "false")
@@ -571,7 +680,7 @@ if USE_API_MODE:
     log.info("API mode forced by environment variable (JSON loader disabled)")
 else:
     # Default behavior:
-    # If data_loader.py exists → JSON loader mode
+    # If data_loader.py exists â†’ JSON loader mode
     # If not, fall back to API adapter
     try:
         from data_loader import (
@@ -603,7 +712,7 @@ try:
     log.info("API adapter loaded successfully")
 except ImportError:
     USE_API_ADAPTER = False
-    log.warning("adapter.py not found — API requests disabled")
+    log.warning("adapter.py not found â€” API requests disabled")
 
 # -------------------------------------------------------
 # Determine final data mode
@@ -627,7 +736,7 @@ try:
     log.info("Excel-based optimizer loaded")
 except ImportError:
     USE_EXCEL_ALGORITHM = False
-    log.warning("optimizer.py not found — falling back to basic brute-force optimizer")
+    log.warning("optimizer.py not found â€” falling back to basic brute-force optimizer")
 
 # -------------------------------------------------------
 # ROUTES
@@ -636,7 +745,7 @@ except ImportError:
 @app.route("/")
 def index():
     """
-    Main page route — renders templates/index.html.
+    Main page route â€” renders templates/index.html.
     Player lists are loaded dynamically depending on mode:
     - JSON loader mode (development)
     - API adapter mode (production/test mode)
@@ -704,7 +813,7 @@ def index():
     # ---------------------------------------------------
     elif USE_API_ADAPTER:
         try:
-            log.info("API mode enabled — fetching players via SLUGGER API")
+            log.info("API mode enabled â€” fetching players via SLUGGER API")
             players = fetch_players(limit=1000)
             log.info(f"Received {len(players)} players from API")
 
@@ -812,9 +921,9 @@ def api_compute():
 
             pitcher_hand_for_api = (
                 pitcher_hand.replace("HP", "").upper() if pitcher_hand else "R"
-            )  # e.g., "RHP" → "R"
+            )  # e.g., "RHP" â†’ "R"
 
-            # Step 1 — Pull spray data from the SLUGGER API
+            # Step 1 â€” Pull spray data from the SLUGGER API
             spray_data = fetch_player_spray(
                 player_id=batter_id,
                 pitcher_hand=pitcher_hand_for_api,
@@ -830,12 +939,12 @@ def api_compute():
                     "error": "No spray data available for this player."
                 }), 404
 
-            # Step 2 — Convert JSON → DataFrame
+            # Step 2 â€” Convert JSON â†’ DataFrame
             from data_loader import parse_spray_to_dataframe
             df = parse_spray_to_dataframe(spray_data)
 
             # ---------------------------------------------------
-            # Parsing failure → fallback to synthetic
+            # Parsing failure â†’ fallback to synthetic
             # ---------------------------------------------------
             if df.empty:
                 log.warning(f"Failed to parse spray data for {batter_id}, using synthetic fallback")
@@ -862,10 +971,11 @@ def api_compute():
                 df = df_drawn.copy()
                 df["x"] = (df_drawn["x"] - 150) * 0.5
                 df["y"] = (df_drawn["y"] - 200) * 2.0
-                df["outcome"] = df.get("outcome", "OUT")
                 df["hang_time"] = df.get("hang_time", 3.0)
 
                 positions_drawn = optimize_outfield(df_drawn)
+                df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+                df["outcome"] = df_drawn["outcome"].values[:len(df)]
 
             # ---------------------------------------------------
             # Parsed successfully but insufficient rows
@@ -899,13 +1009,14 @@ def api_compute():
                     df = df_drawn.copy()
                     df["x"] = (df_drawn["x"] - 150) * 0.5
                     df["y"] = (df_drawn["y"] - 200) * 2.0
-                    df["outcome"] = df.get("outcome", "OUT")
                     df["hang_time"] = df.get("hang_time", 3.0)
 
                     positions_drawn = optimize_outfield(df_drawn)
+                    df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+                    df["outcome"] = df_drawn["outcome"].values[:len(df)]
 
                 # ---------------------------------------------------
-                # Valid real API data — normal processing
+                # Valid real API data â€” normal processing
                 # ---------------------------------------------------
                 else:
                     df_filtered["hang_time"] = df_filtered["hang_time"].fillna(3.0)
@@ -985,9 +1096,10 @@ def api_compute():
                     df = df_drawn.copy()
                     df["x"] = (df_drawn["x"] - 150) * 0.5
                     df["y"] = (df_drawn["y"] - 200) * 2.0
-                    df["outcome"] = "OUT"
                     df["hang_time"] = 3.0
                     positions_drawn = optimize_outfield(df_drawn)
+                    df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+                    df["outcome"] = df_drawn["outcome"].values[:len(df)]
                 else:
                     df = df.dropna(subset=["x", "y"])
                     df["hang_time"] = df["hang_time"].fillna(3.0)
@@ -1005,9 +1117,10 @@ def api_compute():
                 df = df_drawn.copy()
                 df["x"] = (df_drawn["x"] - 150) * 0.5
                 df["y"] = (df_drawn["y"] - 200) * 2.0
-                df["outcome"] = "OUT"
                 df["hang_time"] = 3.0
                 positions_drawn = optimize_outfield(df_drawn)
+                df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+                df["outcome"] = df_drawn["outcome"].values[:len(df)]
 
         # ---------------------------------------------------
         # MODE 3: Neither JSON loader nor API adapter available
@@ -1022,9 +1135,10 @@ def api_compute():
             df = df_drawn.copy()
             df["x"] = (df_drawn["x"] - 150) * 0.5
             df["y"] = (df_drawn["y"] - 200) * 2.0
-            df["outcome"] = "OUT"
             df["hang_time"] = 3.0
             positions_drawn = optimize_outfield(df_drawn)
+            df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+            df["outcome"] = df_drawn["outcome"].values[:len(df)]
 
         # ---------------------------------------------------
         # Save optimized CSV 
@@ -1275,7 +1389,7 @@ def api_optimize_and_visualize(player_id: str):
             background_image_path = request.args.get("background_image_path", "img/background.png")
 
         # -------------------------------------------------------
-        # Step 1 — Fetch spray data from SLUGGER API
+        # Step 1 â€” Fetch spray data from SLUGGER API
         # -------------------------------------------------------
         spray_data = fetch_player_spray(
             player_id=player_id,
@@ -1292,7 +1406,7 @@ def api_optimize_and_visualize(player_id: str):
             }), 404
 
         # -------------------------------------------------------
-        # Step 2 — Convert raw spray JSON → DataFrame
+        # Step 2 â€” Convert raw spray JSON â†’ DataFrame
         # -------------------------------------------------------
         from data_loader import parse_spray_to_dataframe
         df = parse_spray_to_dataframe(spray_data)
@@ -1313,7 +1427,7 @@ def api_optimize_and_visualize(player_id: str):
             }), 400
 
         # -------------------------------------------------------
-        # Step 3 — Convert MLB coordinates → Logical coordinates
+        # Step 3 â€” Convert MLB coordinates â†’ Logical coordinates
         # -------------------------------------------------------
         from mlb_to_logical_converter import convert_dataframe_mlb_to_logical
 
@@ -1324,18 +1438,18 @@ def api_optimize_and_visualize(player_id: str):
         )
 
         # -------------------------------------------------------
-        # Step 4 — Run optimization in logical coordinate space
+        # Step 4 â€” Run optimization in logical coordinate space
         # -------------------------------------------------------
         from optimizer import optimize_outfield_excel
         positions_excel_grid = optimize_outfield_excel(df_logical)
 
-        # Convert optimizer grid output → logical coordinates
+        # Convert optimizer grid output â†’ logical coordinates
         from excel_grid_to_logical_converter import convert_optimizer_positions_to_logical
 
         positions_logical = convert_optimizer_positions_to_logical(positions_excel_grid)
 
         # -------------------------------------------------------
-        # Step 5 — Render visualization (background or drawn field)
+        # Step 5 â€” Render visualization (background or drawn field)
         # -------------------------------------------------------
         batter_label = f"Player {player_id[:8]}"
 
@@ -1348,7 +1462,7 @@ def api_optimize_and_visualize(player_id: str):
         )
 
         # -------------------------------------------------------
-        # Step 6 — Convert logical → pixel coordinates for display
+        # Step 6 â€” Convert logical â†’ pixel coordinates for display
         # -------------------------------------------------------
         from outfield_region import OutfieldRegionManager
 
@@ -1360,7 +1474,7 @@ def api_optimize_and_visualize(player_id: str):
             positions_pixel[name] = (float(px), float(py))
 
         # -------------------------------------------------------
-        # Step 7 — Return complete response
+        # Step 7 â€” Return complete response
         # -------------------------------------------------------
         return jsonify({
             "success": True,

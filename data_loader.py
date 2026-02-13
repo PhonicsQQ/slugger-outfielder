@@ -1,4 +1,4 @@
-# data_loader.py — JSON-file-based data loader (development/testing use only)
+# data_loader.py â€” JSON-file-based data loader (development/testing use only)
 #
 # Note:
 #   This module is intended ONLY for development and testing.
@@ -140,7 +140,7 @@ def load_ballparks() -> List[Dict]:
 
 
 # -------------------------------------------------------
-# Spray data → DataFrame transformation
+# Spray data â†’ DataFrame transformation
 # -------------------------------------------------------
 
 def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
@@ -217,9 +217,9 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
         distance_val = item.get("distance")
         runs_scored = item.get("runs_scored", 0)
 
-        if play_result == "OUT" or outs_on_play > 0:
-            outcome = "OUT"
-        elif play_result in ["SINGLE", "1B"]:
+        # Check explicit hit outcomes FIRST (a play can have outs_on_play > 0
+        # and still be a hit, e.g. a single where another runner is thrown out)
+        if play_result in ["SINGLE", "1B"]:
             outcome = "SINGLE"
         elif play_result in ["DOUBLE", "2B"]:
             outcome = "DOUBLE"
@@ -227,6 +227,8 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
             outcome = "TRIPLE"
         elif play_result in ["HOMERUN", "HOME_RUN", "HR"]:
             outcome = "HOMERUN"
+        elif play_result == "OUT" or outs_on_play > 0:
+            outcome = "OUT"
         else:
             # Infer outcome when "Undefined" or missing
             if outs_on_play > 0:
@@ -243,7 +245,7 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
             else:
                 outcome = "OUT"
 
-        # Hang time — use JSON value; placeholder for future physics calculation
+        # Hang time â€” use JSON value; placeholder for future physics calculation
         hang_time = item.get("hang_time")
 
         record = {
@@ -305,7 +307,7 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
 def get_player_spray_dataframe(player_id: str) -> pd.DataFrame:
     """
     Convenience wrapper:
-    Load raw JSON → convert to cleaned DataFrame.
+    Load raw JSON â†’ convert to cleaned DataFrame.
 
     Args:
         player_id: UUID of player
