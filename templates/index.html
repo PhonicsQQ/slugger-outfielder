@@ -1,44 +1,109 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Outfield Positioning Optimizer</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<meta charset="utf-8">
+<title>Outfield Positioning Optimizer</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
-  <h1>Outfield Positioning Optimizer</h1>
-  <div class="layout">
-    <div class="panel">
-      <label>Pitcher Handedness</label>
-      <select id="pitcher_hand">
-        <option value="RHP">RHP</option>
-        <option value="LHP">LHP</option>
-      </select>
+<h1>Outfield Positioning Optimizer</h1>
+<div class="layout">
+<div class="panel">
+<label>Pitcher Handedness</label>
+<select id="pitcher_hand">
+<option value="RHP">RHP</option>
+<option value="LHP">LHP</option>
+</select>
+<label>Batter &amp; Side</label>
+<div id="batter-status" style="font-size:12px; color:#aaa; margin-bottom:4px;">
+  ⏳ Filtering players with data...
+</div>
+<select id="batter_id">
+  {% for bid, meta in batters.items() %}
+  <option value="{{ bid }}" data-name="{{ meta.batter_name }}" data-hand="{{ meta.batter_hand }}">{{ meta.label }}</option>
+  {% endfor %}
+</select>
+<button type="button" onclick="run()">Generate Positions</button>
+<p class="info-text">
+  Demo uses synthetic spray charts per batter/handedness matchup.
+</p>
+<p class="info-text-small">
+  <a href="/download" class="info-link">Download latest LF/CF/RF CSV</a>
+</p>
+</div>
+<div id="screen">
+<div class="initial-message">
+  Select pitcher handedness and batter to generate optimized outfield positioning.
+</div>
+</div>
+</div>
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+<script>
+(function() {
+  var pollInterval = null;
+  var replaced = false;
 
-      <label>Batter &amp; Side</label>
-      <select id="batter_id">
-        {% for bid, meta in batters.items() %}
-          <option value="{{ bid }}" data-name="{{ meta.batter_name }}" data-hand="{{ meta.batter_hand }}">{{ meta.label }}</option>
-        {% endfor %}
-      </select>
+  function pollCacheStatus() {
+    fetch("/api/cache-status")
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var statusDiv = document.getElementById("batter-status");
+        var select = document.getElementById("batter_id");
+        var batters = data.batters || {};
+        var count = Object.keys(batters).length;
 
-      <button type="button" onclick="run()">Generate Positions</button>
-      <p class="info-text">
-        Demo uses synthetic spray charts per batter/handedness matchup.
-      </p>
-      <p class="info-text-small">
-        <a href="/download" class="info-link">Download latest LF/CF/RF CSV</a>
-      </p>
-    </div>
+        // Update status text
+        if (data.ready) {
+          clearInterval(pollInterval);
+          statusDiv.textContent = "✓ " + count + " players with data";
+          statusDiv.style.color = "#4caf50";
+        } else {
+          statusDiv.textContent = "⏳ Filtering... (" + data.probed + "/" + data.total + " checked, " + count + " confirmed)";
+        }
 
-    <div id="screen">
-      <div class="initial-message">
-        Select pitcher handedness and batter to generate optimized outfield positioning.
-      </div>
-    </div>
-  </div>
+        // Once we have at least 10 confirmed players, replace the dropdown
+        if (count >= 10 && !replaced) {
+          replaced = true;
+          var currentVal = select.value;
+          var entries = Object.entries(batters).sort(function(a, b) {
+            return a[1].label.localeCompare(b[1].label);
+          });
+          select.innerHTML = "";
+          entries.forEach(function(entry) {
+            var opt = document.createElement("option");
+            opt.value = entry[0];
+            opt.dataset.name = entry[1].batter_name;
+            opt.dataset.hand = entry[1].batter_hand;
+            opt.textContent = entry[1].label;
+            if (entry[0] === currentVal) opt.selected = true;
+            select.appendChild(opt);
+          });
+        }
 
-  <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+        // When fully done, do a final clean replacement
+        if (data.ready && count > 0) {
+          var currentVal = select.value;
+          var entries = Object.entries(batters).sort(function(a, b) {
+            return a[1].label.localeCompare(b[1].label);
+          });
+          select.innerHTML = "";
+          entries.forEach(function(entry) {
+            var opt = document.createElement("option");
+            opt.value = entry[0];
+            opt.dataset.name = entry[1].batter_name;
+            opt.dataset.hand = entry[1].batter_hand;
+            opt.textContent = entry[1].label;
+            if (entry[0] === currentVal) opt.selected = true;
+            select.appendChild(opt);
+          });
+        }
+      })
+      .catch(function(err) { console.warn("Cache poll failed:", err); });
+  }
+
+  pollCacheStatus();
+  pollInterval = setInterval(pollCacheStatus, 3000);
+})();
+</script>
 </body>
 </html>
-

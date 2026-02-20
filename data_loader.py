@@ -267,6 +267,9 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
             "outs_on_play": outs_on_play,
             "runs_scored": runs_scored,
             "play_result": play_result,
+            "pitch_call": item.get("pitch_call", ""),
+            "auto_hit_type": item.get("auto_hit_type", ""),
+            "tagged_hit_type": item.get("tagged_hit_type", ""),
         }
 
         records.append(record)
@@ -277,29 +280,38 @@ def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
     df = df.dropna(subset=["x", "y"])
 
     # ---------------------------------------------------
-    # Filtering per specification
+    # ---------------------------------------------------
+    # Filtering: keep only real outfield batted balls
     # ---------------------------------------------------
 
-    # Remove home runs
+    # Step 1: Remove pitches not put in play (fouls, strikeouts, balls, etc.)
+    if "pitch_call" in df.columns:
+        df = df[df["pitch_call"].str.strip().str.lower() == "inplay"]
+
+    # Step 2: Remove bunts and ground balls by hit type
+    EXCLUDE_HIT_TYPES = {"groundball", "bunt"}
+    if "auto_hit_type" in df.columns:
+        df = df[~df["auto_hit_type"].str.strip().str.lower().isin(EXCLUDE_HIT_TYPES)]
+    if "tagged_hit_type" in df.columns:
+        df = df[~df["tagged_hit_type"].str.strip().str.lower().isin(EXCLUDE_HIT_TYPES)]
+
+    # Step 3: Keep only outfield-relevant outcomes
     VALID_OUTCOMES = ["OUT", "SINGLE", "DOUBLE"]
     if "outcome" in df.columns:
         df = df[df["outcome"].isin(VALID_OUTCOMES)]
 
-    # Remove ground balls (launch_angle <= 10 degrees)
+    # Step 4: Remove ground balls by launch angle (belt-and-suspenders)
     if "angle" in df.columns:
         df = df[df["angle"] > 10]
 
-    # Keep only outfield balls
+    # Step 5: Keep only outfield-distance balls (>= 150 ft)
+    # Lowered from 200 to 150 to retain more data from limited sample sizes
     if "distance" in df.columns:
-        df = df[df["distance"] >= 200]
+        df = df[df["distance"] >= 150]
     else:
-        # If no distance, use y-distribution heuristic
         if len(df) > 0:
-            threshold = df["y"].quantile(0.7)
+            threshold = df["y"].quantile(0.5)
             df = df[df["y"] >= threshold]
-    
-    if "y" in df.columns:
-        df = df[df["y"] >= 200]
 
     return df
 

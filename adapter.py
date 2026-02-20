@@ -194,90 +194,123 @@ def fetch_player_spray(player_id: str,
                        limit: int = 5000) -> List[Dict]:
     """
     Fetch spray chart data for a specific batter using the /pitches endpoint.
+    Paginates automatically to collect all available data up to `limit` rows.
+    Each page requests 1000 records (the API maximum per request).
     """
+    import time
+
+    PAGE_SIZE = 1000
     url = f"{BASE_URL}/pitches"
-    params = {"batter_id": player_id, "limit": min(limit, 1000)}
-    
-    if start_date:
-        params["date_range_start"] = start_date
-    if end_date:
-        params["date_range_end"] = end_date
-    
-    log.info(f"Pitches API request: {url}")
-    
     max_retries = 2
-    retry_count = 0
-    data = None
-    
-    while retry_count <= max_retries:
-        try:
-            response = requests.get(url, headers=HEADERS, params=params, timeout=30)
-            log.info(f"HTTP Status Code: {response.status_code}")
-            
-            if response.status_code == 502:
+
+    def normalize_pitcher(value):
+        if not value:
+            return None
+        v = str(value).upper().strip()
+        if v.startswith("RIGHT") or v == "R":
+            return "R"
+        if v.startswith("LEFT") or v == "L":
+            return "L"
+        return None
+
+    def is_batted_ball(p):
+        return any([
+            p.get("hit_trajectory_xc2") is not None,
+            p.get("hit_trajectory_xc1") is not None,
+            p.get("hit_trajectory_xc0") is not None,
+            p.get("direction") is not None,
+            p.get("exit_speed") is not None
+        ])
+
+    pitcher_hand_upper = None
+    if pitcher_hand:
+        pitcher_hand_upper = pitcher_hand.replace("HP", "").upper()
+
+    all_pitches = []
+    page = 1
+
+    while len(all_pitches) < limit:
+        params = {
+            "batter_id": player_id,
+            "limit": PAGE_SIZE,
+            "page": page
+        }
+        if start_date:
+            params["date_range_start"] = start_date
+        if end_date:
+            params["date_range_end"] = end_date
+
+        log.info(f"Fetching page {page} for player {player_id} (collected {len(all_pitches)} so far)")
+
+        retry_count = 0
+        data = None
+
+        while retry_count <= max_retries:
+            try:
+                response = requests.get(url, headers=HEADERS, params=params, timeout=30)
+                log.info(f"Page {page} — HTTP {response.status_code}")
+
+                if response.status_code == 502:
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        time.sleep(retry_count * 2)
+                        continue
+                    raise requests.exceptions.HTTPError("502 after retries")
+
+                response.raise_for_status()
+                data = response.json()
+                break
+
+            except requests.exceptions.RequestException as e:
                 retry_count += 1
                 if retry_count <= max_retries:
-                    import time
                     time.sleep(retry_count * 2)
                     continue
-                raise requests.exceptions.HTTPError("502 after retries")
-            
-            response.raise_for_status()
-            data = response.json()
+                log.error(f"API request failed on page {page}: {str(e)}")
+                break
+
+        # If this page failed entirely, stop paginating and use what we have
+        if not data:
+            log.warning(f"Page {page} failed — stopping pagination with {len(all_pitches)} rows")
             break
-        
-        except requests.exceptions.RequestException as e:
-            retry_count += 1
-            if retry_count <= max_retries:
-                import time
-                time.sleep(retry_count * 2)
-                continue
-            
-            log.error(f"API request failed: {str(e)}")
-            fallback = _load_spray_from_local_file(player_id, pitcher_hand)
-            return fallback
-    
-    if not data:
-        fallback = _load_spray_from_local_file(player_id, pitcher_hand)
-        return fallback
-    
-    if data.get("success"):
-        pitches_data = data.get("data", [])
-        
-        filtered_pitches = [
-            p for p in pitches_data
-            if any([
-                p.get("hit_trajectory_xc2") is not None,
-                p.get("hit_trajectory_xc1") is not None,
-                p.get("hit_trajectory_xc0") is not None,
-                p.get("direction") is not None,
-                p.get("exit_speed") is not None
-            ])
-        ]
-        
-        if pitcher_hand:
-            pitcher_hand_upper = pitcher_hand.replace("HP", "").upper()
-            
-            def normalize(value):
-                if not value:
-                    return None
-                v = str(value).upper().strip()
-                if v.startswith("RIGHT") or v == "R":
-                    return "R"
-                if v.startswith("LEFT") or v == "L":
-                    return "L"
-                return None
-            
-            filtered_pitches = [
-                p for p in filtered_pitches
-                if normalize(p.get("pitcher_throws")) == pitcher_hand_upper
+
+        if not data.get("success"):
+            log.error(f"API error on page {page}: {data.get('message')}")
+            break
+
+        page_pitches = data.get("data", [])
+        log.info(f"Page {page} returned {len(page_pitches)} rows")
+
+        # No more data — we've exhausted all pages
+        if not page_pitches:
+            log.info(f"No more data after page {page - 1} — pagination complete")
+            break
+
+        # Filter to batted balls only
+        page_pitches = [p for p in page_pitches if is_batted_ball(p)]
+
+        # Filter by pitcher hand if requested
+        if pitcher_hand_upper:
+            page_pitches = [
+                p for p in page_pitches
+                if normalize_pitcher(p.get("pitcher_throws")) == pitcher_hand_upper
             ]
-        
-        return filtered_pitches
-    
-    else:
-        fallback = _load_spray_from_local_file(player_id, pitcher_hand)
-        return fallback
+
+        all_pitches.extend(page_pitches)
+
+        # If the API returned fewer than a full page, we're done
+        if len(data.get("data", [])) < PAGE_SIZE:
+            log.info(f"Last page reached — total collected: {len(all_pitches)}")
+            break
+
+        page += 1
+
+    if not all_pitches:
+        log.warning(f"No spray data from API for {player_id} — trying local fallback")
+        return _load_spray_from_local_file(player_id, pitcher_hand)
+
+    log.info(f"Total pitches collected for {player_id}: {len(all_pitches)}")
+    return all_pitches[:limit]
 
 
 def fetch_players(team_name: Optional[str] = None,
@@ -359,3 +392,33 @@ def fetch_batted_balls(player_ids: Optional[List[str]] = None,
     except Exception as e:
         log.error(f"Failed to fetch batted balls: {e}")
         return []
+
+
+def probe_player_has_data(player_id: str) -> bool:
+    """
+    Check if a player has at least 1 usable outfield ball in play.
+    Applies the same core filters as parse_spray_to_dataframe.
+    """
+    EXCLUDE_HIT_TYPES = {"groundball", "bunt"}
+    try:
+        url = f"{BASE_URL}/pitches"
+        params = {"batter_id": player_id, "limit": 50}
+        response = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if response.status_code != 200:
+            return False
+        data = response.json()
+        if not data.get("success"):
+            return False
+        for p in data.get("data", []):
+            if (p.get("pitch_call") or "").strip().lower() != "inplay":
+                continue
+            if (p.get("auto_hit_type") or "").strip().lower() in EXCLUDE_HIT_TYPES:
+                continue
+            if (p.get("angle") or 0) <= 10:
+                continue
+            if (p.get("distance") or 0) < 150:
+                continue
+            return True
+        return False
+    except Exception:
+        return False

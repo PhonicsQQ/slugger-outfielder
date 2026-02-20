@@ -233,7 +233,7 @@ def make_plot(df: pd.DataFrame,
     # Color map for outcomes
     color_map = {
         "1B": "#42a5f5",
-        "2B": "#66bb6a",
+        "2B": "#ec42f5",
         "3B": "#ffa726",
         "OUT": "#bdbdbd"
     }
@@ -403,11 +403,11 @@ def make_plot_with_image(
     color_map = {
         "OUT": "#bdbdbd",
         "SINGLE": "#42a5f5",
-        "DOUBLE": "#66bb6a",
+        "DOUBLE": "#ec42f5",
         "TRIPLE": "#ffa726",
         "HOMERUN": "#ef5350",
         "1B": "#42a5f5",
-        "2B": "#66bb6a",
+        "2B": "#ec42f5",
         "3B": "#ffa726",
         "HR": "#ef5350",
     }
@@ -559,7 +559,7 @@ def make_plot_with_image(
         outcome_colors = {
             "OUT": "#bdbdbd",
             "SINGLE": "#42a5f5",
-            "DOUBLE": "#66bb6a",
+            "DOUBLE": "#ec42f5",
         }
 
         new_balls = []
@@ -617,7 +617,6 @@ def make_plot_with_image(
         Patch(facecolor=color_map["OUT"], label="OUT"),
         Patch(facecolor=color_map["SINGLE"], label="SINGLE"),
         Patch(facecolor=color_map["DOUBLE"], label="DOUBLE"),
-        Patch(facecolor=color_map["TRIPLE"], label="TRIPLE"),
     ]
 
     ax.legend(
@@ -872,6 +871,8 @@ def index():
 
             if actual_batters:
                 log.info(f"Loaded {len(actual_batters)} players from API")
+                if not _cache_ready and not _players_with_data_cache:
+                    _start_background_probe(players)
                 return render_template("index.html", batters=actual_batters)
             else:
                 log.warning("API returned players, but all were invalid or removed")
@@ -886,6 +887,91 @@ def index():
     # ---------------------------------------------------
     else:
         return render_template("index.html", batters=BATTERS)
+
+
+# -------------------------------------------------------
+# Background probe cache
+# -------------------------------------------------------
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_players_with_data_cache = {}
+_cache_ready = False
+
+def _probe_player_has_data(player_id: str) -> bool:
+    try:
+        from adapter import probe_player_has_data
+        return probe_player_has_data(player_id)
+    except Exception:
+        return False
+
+def _start_background_probe(players: list) -> None:
+    players_to_probe = players[:500]
+
+    def run():
+        global _players_with_data_cache, _cache_ready
+        def probe(player):
+            pid = player.get("player_id")
+            if not pid:
+                return pid, False
+            return pid, _probe_player_has_data(pid)
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(probe, p): p for p in players_to_probe}
+            for future in as_completed(futures):
+                pid, result = future.result()
+                if pid:
+                    _players_with_data_cache[pid] = result
+
+        _cache_ready = True
+        found = sum(1 for v in _players_with_data_cache.values() if v)
+        log.info(f"Background probe complete: {found}/{len(players_to_probe)} players have data")
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+
+@app.route("/api/cache-status")
+def api_cache_status():
+    try:
+        players = fetch_players(limit=1000)
+    except Exception:
+        return jsonify({"ready": False, "batters": {}, "probed": 0, "total": 0})
+
+    batters = {}
+    seen_names = set()
+    for player in players:
+        player_id = player.get("player_id")
+        if not player_id:
+            continue
+        if not _players_with_data_cache.get(player_id, False):
+            continue
+        player_name = (player.get("player_name") or "").strip()
+        if not player_name or len(player_name) < 2:
+            continue
+        batting_hand = (player.get("player_batting_handedness") or "").upper()
+        if batting_hand in ["LEFT", "L"]:
+            hand = "L"
+        elif batting_hand in ["RIGHT", "R"]:
+            hand = "R"
+        else:
+            hand = "U"
+        key_pair = (player_name, hand)
+        if key_pair in seen_names:
+            continue
+        seen_names.add(key_pair)
+        batters[player_id] = {
+            "label": f"{player_name} ({hand})",
+            "batter_name": player_name,
+            "batter_hand": hand,
+        }
+
+    return jsonify({
+        "ready": _cache_ready,
+        "batters": batters,
+        "probed": len(_players_with_data_cache),
+        "total": len(players)
+    })
 
 @app.route("/api/compute", methods=["POST"])
 def api_compute():
