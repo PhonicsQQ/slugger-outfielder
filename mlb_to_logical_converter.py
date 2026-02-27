@@ -29,10 +29,10 @@ from typing import Tuple, List
 # X bounds match the outfield polygon width
 # Y bounds cover the full visible outfield: from the fence (pixel ~750, logical ~32)
 # down to the infield edge (pixel ~1222, logical ~-14)
-LOGICAL_X_MIN = -100.00
-LOGICAL_X_MAX = 63.00
-LOGICAL_Y_MIN = 5.00
-LOGICAL_Y_MAX = 50.00
+LOGICAL_X_MIN = -78.00
+LOGICAL_X_MAX = 40.00
+LOGICAL_Y_MIN = 13.00
+LOGICAL_Y_MAX = 37.00
 
 # Logical reference points (fixed)
 LOGICAL_LF = (-60.0, 20.0)
@@ -48,7 +48,7 @@ def mlb_to_logical_simple_scale(
     """
     Convert MLB coordinates into logical coordinates using simple linear scaling.
 
-    This method is not perfectly accurate, but it guarantees that resulting
+    This method is not perfectly accurate, but ißß guarantees that resulting
     logical coordinates fall within the valid logical coordinate bounds.
 
     Args:
