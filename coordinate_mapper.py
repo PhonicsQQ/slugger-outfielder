@@ -11,10 +11,10 @@ import numpy as np
 from typing import Tuple, Optional
 
 # Logical coordinate bounds (from outfield_region_config.json)
-LOGICAL_X_MIN = -89.50
-LOGICAL_X_MAX = 52.66
-LOGICAL_Y_MIN = -43.85
-LOGICAL_Y_MAX = -14.18
+LOGICAL_X_MIN = -85.50
+LOGICAL_X_MAX = 45.66
+LOGICAL_Y_MIN = 13.85
+LOGICAL_Y_MAX = 37.18
 
 # Excel grid parameter bounds (same structure used in optimizer.py)
 EXCEL_GRID_PARAMS = {

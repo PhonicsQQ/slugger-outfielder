@@ -1,136 +1,418 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-MLB Coordinate â†’ Logical Coordinate Converter
+# data_loader.py – JSON-file-based data loader (development/testing use only)
+#
+# Note:
+#   This module is intended ONLY for development and testing.
+#   For distribution and production use, replace this with adapter.py
+#   (which fetches real data from the SLUGGER API).
 
-Logical coordinate system definition:
-    X range: -89.50 ~ 52.66
-    Y range: -43.85 ~ -14.18
-
-Reference logical label points:
-    LF = (-60, 20)
-    CF = (-20, 25)
-    RF = (20, 20)
-
-This module provides a simple scaling-based method for converting MLB hit
-coordinates into the logical coordinate system used by the optimizer.
-
-Note:
-    A more precise conversion is done via affine transforms in other modules.
-    This version serves as a robust fallback that guarantees all outputs remain
-    within logical coordinate bounds.
-"""
-
-import numpy as np
+import json
+import logging
+import math
+import os
+from pathlib import Path
+from typing import List, Dict, Optional, Any
 import pandas as pd
-from typing import Tuple, List
 
-# Logical coordinate bounds for visualization mapping
-# X bounds match the outfield polygon width
-# Y bounds cover the full visible outfield: from the fence (pixel ~750, logical ~32)
-# down to the infield edge (pixel ~1222, logical ~-14)
-LOGICAL_X_MIN = -78.00
-LOGICAL_X_MAX = 40.00
-LOGICAL_Y_MIN = 13.00
-LOGICAL_Y_MAX = 37.00
+log = logging.getLogger(__name__)
 
-# Logical reference points (fixed)
-LOGICAL_LF = (-60.0, 20.0)
-LOGICAL_CF = (-20.0, 25.0)
-LOGICAL_RF = (20.0, 20.0)
+# Base data directory
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+
+# -------------------------------------------------------
+# Basic load functions
+# -------------------------------------------------------
+
+def load_teams() -> List[Dict]:
+    """Load team list from local JSON."""
+    teams_file = DATA_DIR / "teams" / "teams.json"
+    if not teams_file.exists():
+        return []
+    with open(teams_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("data", [])
 
 
-def mlb_to_logical_simple_scale(
-    mlb_x: float, mlb_y: float,
-    mlb_x_range: Tuple[float, float],
-    mlb_y_range: Tuple[float, float]
-) -> Tuple[float, float]:
+def load_players(team_name: Optional[str] = None,
+                 batting_handedness: Optional[str] = None) -> List[Dict]:
     """
-    Convert MLB coordinates into logical coordinates using simple linear scaling.
-
-    This method is not perfectly accurate, but ißß guarantees that resulting
-    logical coordinates fall within the valid logical coordinate bounds.
+    Load all players from JSON files.
 
     Args:
-        mlb_x, mlb_y: MLB coordinates
-        mlb_x_range: Tuple (min_x, max_x) of MLB x-values
-        mlb_y_range: Tuple (min_y, max_y) of MLB y-values
+        team_name: Optional team filter
+        batting_handedness: Optional filter ("Right", "Left", "Switch")
 
     Returns:
-        (logical_x, logical_y) â€” clamped within logical coordinate limits.
+        List[Dict]: List of player dictionaries
     """
-    mlb_x_min, mlb_x_max = mlb_x_range
-    mlb_y_min, mlb_y_max = mlb_y_range
+    players = []
+    players_dir = DATA_DIR / "players"
 
-    # Linear interpolation for X
-    if mlb_x_max - mlb_x_min > 0:
-        logical_x = LOGICAL_X_MIN + ((mlb_x - mlb_x_min) * 
-                    (LOGICAL_X_MAX - LOGICAL_X_MIN) / (mlb_x_max - mlb_x_min))
-    else:
-        logical_x = (LOGICAL_X_MIN + LOGICAL_X_MAX) / 2
+    if not players_dir.exists():
+        return []
 
-    # Linear interpolation for Y
-    if mlb_y_max - mlb_y_min > 0:
-        logical_y = LOGICAL_Y_MIN + ((mlb_y - mlb_y_min) * 
-                    (LOGICAL_Y_MAX - LOGICAL_Y_MIN) / (mlb_y_max - mlb_y_min))
-    else:
-        logical_y = (LOGICAL_Y_MIN + LOGICAL_Y_MAX) / 2
+    for json_file in players_dir.glob("*.json"):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                team_players = data.get("data", [])
 
-    # Clamp to valid logical coordinate bounds
-    logical_x = max(LOGICAL_X_MIN, min(LOGICAL_X_MAX, logical_x))
-    logical_y = max(LOGICAL_Y_MIN, min(LOGICAL_Y_MAX, logical_y))
+                if team_name:
+                    team_players = [
+                        p for p in team_players
+                        if p.get("team_name") == team_name
+                    ]
 
-    return (logical_x, logical_y)
+                if batting_handedness:
+                    team_players = [
+                        p for p in team_players
+                        if p.get("player_batting_handedness") == batting_handedness
+                    ]
+
+                players.extend(team_players)
+
+        except Exception as e:
+            log.error(f"Error loading {json_file}: {e}")
+            continue
+
+    return players
 
 
-def convert_dataframe_mlb_to_logical(
-    df: pd.DataFrame,
-    mlb_x_col: str = "x",
-    mlb_y_col: str = "y"
-):
+def load_spray_data(player_id: str) -> Optional[List[Dict]]:
     """
-    Convert MLB coordinates in an entire DataFrame into logical coordinates.
+    Load raw spray JSON for a given player.
 
     Args:
-        df: Input DataFrame containing MLB coordinate columns
-        mlb_x_col: Name of MLB x-coordinate column
-        mlb_y_col: Name of MLB y-coordinate column
+        player_id: Player UUID
 
     Returns:
-        DataFrame where the specified x/y columns are replaced with their
-        logical coordinate transformations.
+        Optional[List[Dict]]: List of spray entries, or None if not found
     """
-    df_logical = df.copy()
+    spray_file = DATA_DIR / "spray" / f"{player_id}.json"
 
-    mlb_x_values = df[mlb_x_col].dropna().tolist()
-    mlb_y_values = df[mlb_y_col].dropna().tolist()
+    if not spray_file.exists():
+        return None
 
-    # If no coordinate data is available, return unchanged DataFrame
-    if not mlb_x_values or not mlb_y_values:
-        return df_logical
+    try:
+        with open(spray_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("data", [])
+    except Exception as e:
+        log.error(f"Error loading spray data for {player_id}: {e}")
+        return None
 
-    # Compute overall MLB coordinate range
-    mlb_x_range = (min(mlb_x_values), max(mlb_x_values))
-    mlb_y_range = (min(mlb_y_values), max(mlb_y_values))
 
-    # Convert each row
-    logical_coords = []
-    for _, row in df.iterrows():
-        mlb_x = row[mlb_x_col]
-        mlb_y = row[mlb_y_col]
+def load_games() -> List[Dict]:
+    """Load game list from JSON."""
+    games_file = DATA_DIR / "games" / "games.json"
+    if not games_file.exists():
+        return []
+    with open(games_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("data", [])
 
-        if pd.isna(mlb_x) or pd.isna(mlb_y):
-            logical_coords.append((None, None))
+
+def load_ballparks() -> List[Dict]:
+    """Load ballpark list from JSON."""
+    ballparks_file = DATA_DIR / "ballparks" / "ballparks.json"
+    if not ballparks_file.exists():
+        return []
+    with open(ballparks_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("data", [])
+
+
+# -------------------------------------------------------
+# Spray data → DataFrame transformation
+# -------------------------------------------------------
+
+# Outcome labels included in optimization & visualization.
+# TRIPLE and HOMERUN are intentionally excluded from outfield
+# positioning analysis (they land in specific non-repositionable zones).
+VALID_OUTCOMES = {"OUT", "SINGLE", "DOUBLE"}
+
+# Hit types that are definitely not outfield balls
+EXCLUDE_HIT_TYPES = {"groundball", "bunt"}
+
+
+def _normalize_pitch_call(value: Any) -> str:
+    """
+    Normalize pitch_call to a canonical lowercase string.
+
+    Handles API variants like "InPlay", "in_play", "In Play", "inplay".
+    All of these collapse to "inplay".
+    """
+    if not value:
+        return ""
+    return str(value).strip().lower().replace("_", "").replace(" ", "")
+
+
+def _normalize_hit_type(value: Any) -> str:
+    """Normalize auto_hit_type / tagged_hit_type to lowercase stripped string."""
+    if not value:
+        return ""
+    return str(value).strip().lower()
+
+
+def parse_spray_to_dataframe(spray_data: List[Dict]) -> pd.DataFrame:
+    """
+    Convert raw spray JSON records into a clean DataFrame.
+
+    Coordinate extraction priority (UPDATED):
+        1. position_at_110_*  (ideal — ball position at 110 ft from home)
+        2. direction + distance  (trigonometric — reliable feet coordinates)
+        3. hit_trajectory_xc2/yc2  (landing point coefficient — NOT in feet)
+        4. hit_trajectory_xc1/yc1  (mid-flight coefficient — NOT in feet)
+        5. hit_trajectory_xc0/yc0  (launch point — least accurate)
+
+    NOTE: direction+distance was promoted to Priority 2 because the
+    hit_trajectory polynomial coefficients (xc2/yc2 etc.) are on a
+    completely different scale from feet. When those coefficients (often
+    in the range -10 to +10) are mapped through the ±350 ft MLB bounds,
+    all dots collapse into a tiny cluster near center field. The trig-
+    based direction+distance calculation produces real feet coordinates
+    that spread correctly across the outfield.
+
+    Filtering (NaN-safe — missing values are NOT treated as failures):
+        • pitch_call must normalize to "inplay"  (flexible matching)
+        • auto_hit_type / tagged_hit_type must NOT be groundball or bunt
+          (if the field is missing/null, we keep the record)
+        • launch angle > 10°  (only excluded if angle is explicitly ≤ 10)
+        • distance ≥ 150 ft  (only excluded if distance is explicitly < 150)
+        • outcome must be OUT, SINGLE, or DOUBLE
+
+    Returns:
+        DataFrame with columns: x, y, z, distance, hang_time, outcome,
+        batter_id, pitcher_throws, date, angle, direction, pitch_call, etc.
+    """
+    if not spray_data:
+        return pd.DataFrame()
+
+    records = []
+
+    for item in spray_data:
+        x, y, z = None, None, None
+
+        # Priority 1: position_at_110 (most representative landing zone)
+        if item.get("position_at_110_x") is not None:
+            x = item["position_at_110_x"]
+            y = item.get("position_at_110_y")
+            z = item.get("position_at_110_z")
+
+        # Priority 2: direction + distance (trigonometric — reliable feet coords)
+        # Promoted above trajectory coefficients because xc2/yc2 are polynomial
+        # coefficients (not feet) and collapse to a tiny cluster when mapped
+        # through the ±350 ft MLB coordinate bounds.
+        elif item.get("direction") is not None and item.get("distance") is not None:
+            direction = item.get("direction")
+            distance = item.get("distance")
+            try:
+                direction = float(direction)
+                distance = float(distance)
+                if distance > 0:
+                    rad = math.radians(direction)
+                    x = distance * math.sin(rad)
+                    y = distance * math.cos(rad)
+                    z = item.get("position_at_110_z") or item.get("hit_trajectory_zc1")
+            except (TypeError, ValueError):
+                pass
+
+        # Priority 3: hit_trajectory xc2/yc2 (landing point coefficient)
+        # WARNING: these are polynomial coefficients, NOT positions in feet.
+        # Only used as fallback when direction+distance are both missing.
+        elif item.get("hit_trajectory_xc2") is not None:
+            x = item["hit_trajectory_xc2"]
+            y = item.get("hit_trajectory_yc2")
+            z = item.get("hit_trajectory_zc2")
+
+        # Priority 4: hit_trajectory xc1/yc1 (mid-flight coefficient)
+        elif item.get("hit_trajectory_xc1") is not None:
+            x = item["hit_trajectory_xc1"]
+            y = item.get("hit_trajectory_yc1")
+            z = item.get("hit_trajectory_zc1")
+
+        # Priority 5: xc0/yc0 (launch point — least ideal but still useful)
+        elif item.get("hit_trajectory_xc0") is not None:
+            x = item["hit_trajectory_xc0"]
+            y = item.get("hit_trajectory_yc0")
+            z = item.get("hit_trajectory_zc0")
+
+        # ---------------------------------------------------
+        # Outcome classification
+        # ---------------------------------------------------
+        play_result = (item.get("play_result") or "").strip().upper()
+        outs_on_play = item.get("outs_on_play", 0) or 0
+        distance_val = item.get("distance")
+        runs_scored = item.get("runs_scored", 0)
+
+        if play_result in ("SINGLE", "1B"):
+            outcome = "SINGLE"
+        elif play_result in ("DOUBLE", "2B"):
+            outcome = "DOUBLE"
+        elif play_result in ("TRIPLE", "3B"):
+            outcome = "TRIPLE"
+        elif play_result in ("HOMERUN", "HOME_RUN", "HR"):
+            outcome = "HOMERUN"
+        elif play_result in (
+            "OUT", "ERROR", "FIELDERSCHOICE", "SACRIFICE"
+        ) or outs_on_play > 0:
+            # Error, fielder's choice, and sacrifice are all outs
+            # from a positioning perspective
+            outcome = "OUT"
         else:
-            logical_coords.append(
-                mlb_to_logical_simple_scale(
-                    mlb_x, mlb_y,
-                    mlb_x_range, mlb_y_range
-                )
-            )
+            # Infer from distance when play_result is missing or "Undefined"
+            if distance_val is not None:
+                try:
+                    d = float(distance_val)
+                    if d >= 400:
+                        outcome = "HOMERUN"
+                    elif d >= 300:
+                        outcome = "DOUBLE"
+                    elif d >= 200:
+                        outcome = "SINGLE"
+                    else:
+                        outcome = "OUT"
+                except (TypeError, ValueError):
+                    outcome = "OUT"
+            else:
+                outcome = "OUT"
 
-    # Replace columns with logical values
-    df_logical[mlb_x_col] = [x for x, _ in logical_coords]
-    df_logical[mlb_y_col] = [y for _, y in logical_coords]
+        hang_time = item.get("hang_time")
 
-    return df_logical
+        records.append({
+            "x": x,
+            "y": y,
+            "z": z,
+            "distance": distance_val,
+            "hang_time": hang_time,
+            "outcome": outcome,
+            "batter_id": item.get("batter_id"),
+            "batter_side": item.get("batter_side"),
+            "pitcher_throws": item.get("pitcher_throws"),
+            "pitcher_id": item.get("pitcher_id"),
+            "date": item.get("date"),
+            "game_id": item.get("game_id"),
+            "exit_speed": item.get("exit_speed"),
+            "angle": item.get("angle"),
+            "direction": item.get("direction"),
+            "outs_on_play": outs_on_play,
+            "runs_scored": runs_scored,
+            "play_result": play_result,
+            "pitch_call": item.get("pitch_call", ""),
+            "auto_hit_type": item.get("auto_hit_type", ""),
+            "tagged_hit_type": item.get("tagged_hit_type", ""),
+        })
+
+    df = pd.DataFrame(records)
+    n_start = len(df)
+    log.info(f"[parse_spray] Raw records: {n_start}")
+
+    # Step 0: Drop rows with no x/y coordinates at all
+    df = df.dropna(subset=["x", "y"])
+    log.info(f"[parse_spray] After coordinate check: {len(df)}/{n_start}")
+
+    # ---------------------------------------------------
+    # Step 1: pitch_call must be "inplay" (flexible matching)
+    # Handles: "InPlay", "in_play", "In Play", "inplay"
+    # ---------------------------------------------------
+    if "pitch_call" in df.columns:
+        pitch_norm = df["pitch_call"].apply(_normalize_pitch_call)
+        before = len(df)
+        df = df[pitch_norm == "inplay"]
+        log.info(f"[parse_spray] After pitch_call filter: {len(df)}/{before}")
+    else:
+        log.warning("[parse_spray] No pitch_call column — skipping in-play filter")
+
+    # ---------------------------------------------------
+    # Step 2: Exclude definite ground balls and bunts
+    # Only exclude when auto_hit_type is explicitly populated.
+    # Missing/null hit type → keep the record.
+    # ---------------------------------------------------
+    if "auto_hit_type" in df.columns:
+        before = len(df)
+        auto_norm = df["auto_hit_type"].apply(_normalize_hit_type)
+        df = df[~auto_norm.isin(EXCLUDE_HIT_TYPES) | (auto_norm == "")]
+        log.info(f"[parse_spray] After auto_hit_type filter: {len(df)}/{before}")
+
+    if "tagged_hit_type" in df.columns:
+        before = len(df)
+        tagged_norm = df["tagged_hit_type"].apply(_normalize_hit_type)
+        df = df[~tagged_norm.isin(EXCLUDE_HIT_TYPES) | (tagged_norm == "")]
+        log.info(f"[parse_spray] After tagged_hit_type filter: {len(df)}/{before}")
+
+    # ---------------------------------------------------
+    # Step 3: Outcome filter — keep only outfield-relevant outcomes.
+    # TRIPLE and HOMERUN are excluded from positioning analysis.
+    # ---------------------------------------------------
+    if "outcome" in df.columns:
+        before = len(df)
+        df = df[df["outcome"].isin(VALID_OUTCOMES)]
+        log.info(f"[parse_spray] After outcome filter (OUT/SINGLE/DOUBLE): {len(df)}/{before}")
+
+    # ---------------------------------------------------
+    # Step 4: Launch angle — NaN-safe.
+    # Only exclude rows where angle is EXPLICITLY ≤ 10°.
+    # If angle is null, we don't know it's a groundball — keep it.
+    # ---------------------------------------------------
+    if "angle" in df.columns:
+        before = len(df)
+        angle_ok = df["angle"].isna() | (pd.to_numeric(df["angle"], errors="coerce") > 10)
+        df = df[angle_ok]
+        log.info(f"[parse_spray] After angle filter (>10 or NaN): {len(df)}/{before}")
+
+    # ---------------------------------------------------
+    # Step 5: Distance — NaN-safe.
+    # Only exclude rows where distance is EXPLICITLY < 150 ft.
+    # If distance is null but we have coordinates, keep the record.
+    # ---------------------------------------------------
+    if "distance" in df.columns:
+        before = len(df)
+        dist_ok = df["distance"].isna() | (pd.to_numeric(df["distance"], errors="coerce") >= 150)
+        df = df[dist_ok]
+        log.info(f"[parse_spray] After distance filter (≥150 or NaN): {len(df)}/{before}")
+
+    log.info(f"[parse_spray] Final kept: {len(df)} outfield balls")
+    return df
+
+
+def get_player_spray_dataframe(player_id: str) -> pd.DataFrame:
+    """
+    Convenience wrapper: Load raw JSON → convert to cleaned DataFrame.
+    """
+    spray_data = load_spray_data(player_id)
+    if spray_data is None:
+        return pd.DataFrame()
+    return parse_spray_to_dataframe(spray_data)
+
+
+# -------------------------------------------------------
+# Filtering and utilities
+# -------------------------------------------------------
+
+def filter_players_by_handedness(
+    players: List[Dict],
+    handedness: Optional[str] = None
+) -> List[Dict]:
+    """Filter players by batting handedness."""
+    if handedness is None:
+        return players
+    return [
+        p for p in players
+        if p.get("player_batting_handedness") == handedness
+    ]
+
+
+def get_unique_players_with_spray_data() -> List[Dict]:
+    """Return only players for whom spray JSON files exist."""
+    players = load_players()
+    spray_dir = DATA_DIR / "spray"
+
+    if not spray_dir.exists():
+        return []
+
+    available_ids = {f.stem for f in spray_dir.glob("*.json")}
+
+    return [
+        p for p in players
+        if p.get("player_id") in available_ids
+    ]

@@ -42,6 +42,7 @@ from matplotlib.patches import Polygon, Rectangle
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 log = logging.getLogger(__name__)
 
+
 app = Flask(__name__)
 
 # -------------------------------------------------------
@@ -233,7 +234,7 @@ def make_plot(df: pd.DataFrame,
     # Color map for outcomes
     color_map = {
         "1B": "#42a5f5",
-        "2B": "#ec42f5",
+        "2B": "#66bb6a",
         "3B": "#ffa726",
         "OUT": "#bdbdbd"
     }
@@ -360,6 +361,7 @@ def make_plot(df: pd.DataFrame,
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+
 def make_plot_with_image(
     df: pd.DataFrame,
     positions: Optional[Dict[str, Tuple[float, float]]] = None,
@@ -403,11 +405,11 @@ def make_plot_with_image(
     color_map = {
         "OUT": "#bdbdbd",
         "SINGLE": "#42a5f5",
-        "DOUBLE": "#ec42f5",
+        "DOUBLE": "#66bb6a",
         "TRIPLE": "#ffa726",
         "HOMERUN": "#ef5350",
         "1B": "#42a5f5",
-        "2B": "#ec42f5",
+        "2B": "#66bb6a",
         "3B": "#ffa726",
         "HR": "#ef5350",
     }
@@ -465,58 +467,109 @@ def make_plot_with_image(
     ax.set_ylim(img_height, 0)  # Invert y-axis to match image coordinates
 
     # -------------------------------------------------------
-    # MLB â†’ logical â†’ pixel coordinate transformation for spray points
+    # MLB -> logical -> pixel coordinate transformation for spray points
+    #
+    # Uses a fixed 3-point affine transform so that a ball hit to RF
+    # always appears on the RF side of the image regardless of what
+    # other balls the player has in the dataset.
+    # (The old code used per-dataset min/max bounds which stretched a
+    # player's spray to fill the entire logical space, causing pull
+    # hitters to show all their balls in the wrong outfield zone.)
     # -------------------------------------------------------
+    # MLB -> logical -> pixel coordinate transformation
+    # All tuning parameters live in SPRAY_CONFIG at the top of this file.
+    # -------------------------------------------------------
+    # MLB -> logical -> pixel coordinate transformation
+    #
+    # TUNABLE CONSTANTS — change these to move dots on the background image.
+    # Values are absolute pixel coordinates calibrated for background.avif.
+    #
+    #   OUTFIELD_TOP_PX / OUTFIELD_BOTTOM_PX
+    #     Vertical band where outfield dots are allowed.
+    #     Move dots UP  → decrease both values
+    #     Move dots DOWN → increase both values
+    #     Wider band     → increase BOTTOM or decrease TOP
+    #
+    #   HOME_X/Y_PX, LF/RF_POLE_X/Y_PX
+    #     Define the fair-territory wedge. Dots outside this are dropped.
+    # -------------------------------------------------------
+    OUTFIELD_TOP_PX    = 680    # ← fence / warning track row
+    OUTFIELD_BOTTOM_PX = 1100   # ← infield edge row
+    HOME_X_PX    = 1170         # ← home plate X
+    HOME_Y_PX    = 1600         # ← home plate Y (bottom of 1560px image)
+    LF_POLE_X_PX =  248         # ← left foul pole X
+    LF_POLE_Y_PX =  848         # ← left foul pole Y
+    RF_POLE_X_PX = 2114         # ← right foul pole X
+    RF_POLE_Y_PX =  854         # ← right foul pole Y
+    # -------------------------------------------------------
+
+    # Fixed MLB field bounds in feet — NEVER use per-dataset min/max here.
+    # Using per-dataset bounds stretches a player's handful of RF balls
+    # across the full logical space, making everything land in the same pixel.
+    MLB_X_MIN, MLB_X_MAX = -350.0, 350.0   # left foul line to right foul line
+    MLB_Y_MIN, MLB_Y_MAX =  130.0, 380.0   # shallow to deep outfield
+
+    # Logical coordinate bounds (must match outfield_region_config.json)
+    LOGICAL_X_MIN, LOGICAL_X_MAX = -100.0, 100.0
+    LOGICAL_Y_MIN, LOGICAL_Y_MAX =   13.0, 50.0
+
     balls_pixel = []
 
     if len(df) > 0:
-        from mlb_to_logical_converter import mlb_to_logical_simple_scale
+        for idx, row in df.iterrows():
+            log.info(f"[DEBUG] x range: {df['x'].min():.1f} to {df['x'].max():.1f}")
+            log.info(f"[DEBUG] y range: {df['y'].min():.1f} to {df['y'].max():.1f}")
+            mlb_x = row["x"]
+            mlb_y = row["y"]
 
-        mlb_x_values = df["x"].dropna().tolist()
-        mlb_y_values = df["y"].dropna().tolist()
+            if pd.isna(mlb_x) or pd.isna(mlb_y):
+                continue
 
-        if mlb_x_values and mlb_y_values:
-            mlb_x_range = (min(mlb_x_values), max(mlb_x_values))
-            mlb_y_range = (min(mlb_y_values), max(mlb_y_values))
+            # ---------------------------------------------------------
+            # Map direction + distance directly to curved pixel coords.
+            # This follows the perspective arc of the outfield in the photo.
+            # ---------------------------------------------------------
+            dir_val = row.get("direction")
+            dist_val = row.get("distance")
 
-            for idx, row in df.iterrows():
-                mlb_x = row["x"]
-                mlb_y = row["y"]
+            if dir_val is None or dist_val is None or pd.isna(dir_val) or pd.isna(dist_val):
+                continue
 
-                if pd.isna(mlb_x) or pd.isna(mlb_y):
-                    continue
+            dir_f = float(dir_val)
+            dist_f = float(dist_val)
 
-                logical_x, logical_y = mlb_to_logical_simple_scale(
-                    mlb_x, mlb_y, mlb_x_range, mlb_y_range
-                )
+            # Depth fraction: 0 = shallow (infield edge), 1 = deep (fence)
+            DIST_MIN, DIST_MAX = 150.0, 400.0
+            depth_frac = (dist_f - DIST_MIN) / (DIST_MAX - DIST_MIN)
+            depth_frac = max(0.0, min(1.0, depth_frac))
 
-                pixel_x, pixel_y = outfield_manager.logical_to_pixel(
-                    (logical_x, logical_y)
-                )
+            # Vertical pixel: deeper hits → closer to fence (smaller pixel_y)
+            pixel_y = int(OUTFIELD_BOTTOM_PX - depth_frac * (OUTFIELD_BOTTOM_PX - OUTFIELD_TOP_PX))
 
-                # Clamp to valid pixel range
-                pixel_x = max(0, min(img_width - 1, pixel_x))
-                pixel_y = max(0, min(img_height - 1, pixel_y))
+            # Direction fraction: -45° (LF) to +45° (RF) → 0.0 to 1.0
+            DIR_MIN, DIR_MAX = -45.0, 45.0
+            dir_frac = (dir_f - DIR_MIN) / (DIR_MAX - DIR_MIN)
+            dir_frac = max(0.0, min(1.0, dir_frac))
 
-                # Only keep dots in the outfield grass area
-                # Defined by: fence (top), infield dirt arc (bottom), foul lines (sides)
-                outfield_top = 750      # fence line
-                outfield_bottom = 900   # where outfield grass meets infield dirt
-                if pixel_y > outfield_bottom or pixel_y < outfield_top:
-                    continue
+            # Horizontal pixel: follows the foul-line wedge at this depth.
+            # The wedge naturally narrows toward the fence → curved spray.
+            x_left  = HOME_X_PX + (pixel_y - HOME_Y_PX) * (LF_POLE_X_PX - HOME_X_PX) / (LF_POLE_Y_PX - HOME_Y_PX)
+            x_right = HOME_X_PX + (pixel_y - HOME_Y_PX) * (RF_POLE_X_PX - HOME_X_PX) / (RF_POLE_Y_PX - HOME_Y_PX)
 
-                # Check dot is between the foul lines (fan/wedge from home plate)
-                # Home plate pixel: (1170, 1400)
-                # Left foul pole: (220, 850), Right foul pole: (2140, 854)
-                # Slightly wider than actual poles to allow dots near the lines
-                home_x, home_y = 1170, 1400
-                x_left = home_x + (pixel_y - home_y) * (220 - home_x) / (850 - home_y)
-                x_right = home_x + (pixel_y - home_y) * (2140 - home_x) / (854 - home_y)
-                if pixel_x < x_left or pixel_x > x_right:
-                    continue
+            pixel_x = int(x_left + dir_frac * (x_right - x_left))
 
-                color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
-                balls_pixel.append((pixel_x, pixel_y, color))
+            # Clamp to image bounds
+            pixel_x = max(0, min(img_width  - 1, pixel_x))
+            pixel_y = max(0, min(img_height - 1, pixel_y))
+
+            # Depth filter: keep only the outfield grass band
+            if pixel_y < OUTFIELD_TOP_PX or pixel_y > OUTFIELD_BOTTOM_PX:
+                continue
+
+           
+
+            color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
+            balls_pixel.append((pixel_x, pixel_y, color))
 
     # -------------------------------------------------------
     # Calculate optimized fielder positions from spray dot locations
@@ -559,7 +612,7 @@ def make_plot_with_image(
         outcome_colors = {
             "OUT": "#bdbdbd",
             "SINGLE": "#42a5f5",
-            "DOUBLE": "#ec42f5",
+            "DOUBLE": "#66bb6a",
         }
 
         new_balls = []
@@ -617,6 +670,7 @@ def make_plot_with_image(
         Patch(facecolor=color_map["OUT"], label="OUT"),
         Patch(facecolor=color_map["SINGLE"], label="SINGLE"),
         Patch(facecolor=color_map["DOUBLE"], label="DOUBLE"),
+        Patch(facecolor=color_map["TRIPLE"], label="TRIPLE"),
     ]
 
     ax.legend(
@@ -871,6 +925,7 @@ def index():
 
             if actual_batters:
                 log.info(f"Loaded {len(actual_batters)} players from API")
+                # Kick off background probe if cache not yet ready
                 if not _cache_ready and not _players_with_data_cache:
                     _start_background_probe(players)
                 return render_template("index.html", batters=actual_batters)
@@ -890,33 +945,53 @@ def index():
 
 
 # -------------------------------------------------------
-# Background probe cache
+# Background Player Probe Cache
+# Asynchronously checks which players have qualifying outfield data,
+# so the frontend can progressively filter the player dropdown.
 # -------------------------------------------------------
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-_players_with_data_cache = {}
-_cache_ready = False
+_players_with_data_cache: dict = {}   # player_id -> bool
+_cache_ready: bool = False
 
-def _probe_player_has_data(player_id: str) -> bool:
+
+def _probe_one_player(player_id: str) -> bool:
+    """Probe a single player — wraps the adapter function."""
     try:
         from adapter import probe_player_has_data
         return probe_player_has_data(player_id)
     except Exception:
-        return False
+        return True  # Assume has data on error — don't hide them
+
 
 def _start_background_probe(players: list) -> None:
+    """
+    Spawn a background thread that probes each player for outfield data.
+
+    Respects the SLUGGER API rate limit of 100 req/min:
+      - 2 concurrent workers
+      - 1.2 second stagger per request
+      → ~1.67 req/sec = ~100 req/min with comfortable headroom
+
+    Results are written to _players_with_data_cache as they arrive.
+    _cache_ready is set to True when all probes complete.
+    """
     players_to_probe = players[:500]
 
     def run():
         global _players_with_data_cache, _cache_ready
+
         def probe(player):
             pid = player.get("player_id")
             if not pid:
                 return pid, False
-            return pid, _probe_player_has_data(pid)
+            import time
+            # Rate limit: 100 req/min API cap → stagger to stay safe
+            time.sleep(1.2)
+            return pid, _probe_one_player(pid)
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {executor.submit(probe, p): p for p in players_to_probe}
             for future in as_completed(futures):
                 pid, result = future.result()
@@ -925,41 +1000,67 @@ def _start_background_probe(players: list) -> None:
 
         _cache_ready = True
         found = sum(1 for v in _players_with_data_cache.values() if v)
-        log.info(f"Background probe complete: {found}/{len(players_to_probe)} players have data")
+        log.info(
+            f"Background probe complete: {found}/{len(players_to_probe)} "
+            f"players confirmed with outfield data"
+        )
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
+    log.info(f"Background probe started for {len(players_to_probe)} players")
 
 
 @app.route("/api/cache-status")
 def api_cache_status():
+    """
+    Returns the current background probe status.
+
+    The frontend polls this endpoint every few seconds after page load.
+    Once ready=True, it replaces the full player dropdown with only
+    players confirmed to have outfield data.
+
+    Response:
+        {
+          "ready": bool,
+          "batters": { player_id: {label, batter_name, batter_hand} },
+          "probed": int,   # how many players probed so far
+          "total": int     # total players in the API
+        }
+    """
     try:
         players = fetch_players(limit=1000)
     except Exception:
         return jsonify({"ready": False, "batters": {}, "probed": 0, "total": 0})
 
     batters = {}
-    seen_names = set()
+    seen_names: set = set()
+
     for player in players:
         player_id = player.get("player_id")
         if not player_id:
             continue
+
+        # Only include players confirmed by the probe
         if not _players_with_data_cache.get(player_id, False):
             continue
+
         player_name = (player.get("player_name") or "").strip()
         if not player_name or len(player_name) < 2:
             continue
+
         batting_hand = (player.get("player_batting_handedness") or "").upper()
-        if batting_hand in ["LEFT", "L"]:
+        if batting_hand in ("LEFT", "L"):
             hand = "L"
-        elif batting_hand in ["RIGHT", "R"]:
+        elif batting_hand in ("RIGHT", "R"):
             hand = "R"
         else:
             hand = "U"
+
         key_pair = (player_name, hand)
         if key_pair in seen_names:
             continue
         seen_names.add(key_pair)
+
         batters[player_id] = {
             "label": f"{player_name} ({hand})",
             "batter_name": player_name,
@@ -1025,125 +1126,89 @@ def api_compute():
                     "error": "No spray data available for this player."
                 }), 404
 
-            # Step 2 â€” Convert JSON â†’ DataFrame
+            # Step 2 -- Convert JSON -> DataFrame
             from data_loader import parse_spray_to_dataframe
             df = parse_spray_to_dataframe(spray_data)
 
+            log.info(
+                f"parse_spray_to_dataframe: {len(df)} qualifying outfield rows "
+                f"for player {batter_id}"
+            )
+
             # ---------------------------------------------------
-            # Parsing failure â†’ fallback to synthetic
+            # No qualifying outfield data -> return a proper error.
+            # Do NOT fall back to synthetic — misleading to the user.
             # ---------------------------------------------------
             if df.empty:
-                log.warning(f"Failed to parse spray data for {batter_id}, using synthetic fallback")
-
-                # Determine batter metadata
-                if client_batter_name and client_batter_name.strip():
-                    name = client_batter_name.strip()
-                    bh = client_batter_hand if client_batter_hand else "R"
-                elif batter_id not in BATTERS:
-                    name = f"Player {batter_id[:8]}"
-                    bh = "R"
-                else:
-                    meta = BATTERS[batter_id]
-                    name = meta["batter_name"]
-                    bh = meta["batter_hand"]
-
-                meta = {
-                    "label": f"{name} ({bh})",
-                    "batter_name": name,
-                    "batter_hand": bh
-                }
-
-                df_drawn = generate_spray("dickerson_R", pitcher_hand)
-                df = df_drawn.copy()
-                df["x"] = (df_drawn["x"] - 150) * 0.5
-                df["y"] = (df_drawn["y"] - 200) * 2.0
-                df["hang_time"] = df.get("hang_time", 3.0)
-
-                positions_drawn = optimize_outfield(df_drawn)
-                df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-                df["outcome"] = df_drawn["outcome"].values[:len(df)]
-
-            # ---------------------------------------------------
-            # Parsed successfully but insufficient rows
-            # ---------------------------------------------------
-            else:
-                df_filtered = df.dropna(subset=["x", "y"])
-
-                if len(df_filtered) < 5:
-                    log.warning(
-                        f"Only {len(df_filtered)} rows available; using synthetic fallback"
+                log.warning(f"No qualifying outfield data for player {batter_id}")
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "No qualifying outfield balls found for this player. "
+                        "They may not have enough batted-ball data in the system."
                     )
+                }), 404
 
-                    if client_batter_name and client_batter_name.strip():
-                        name = client_batter_name.strip()
-                        bh = client_batter_hand if client_batter_hand else "R"
-                    elif batter_id not in BATTERS:
+            df_filtered = df.dropna(subset=["x", "y"])
+
+            if len(df_filtered) < 5:
+                log.warning(
+                    f"Only {len(df_filtered)} valid coordinate rows for {batter_id} "
+                    f"(minimum 5 required)"
+                )
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"Only {len(df_filtered)} outfield balls with valid coordinates "
+                        f"(minimum 5 required). "
+                        f"Try selecting a player with more plate appearances."
+                    )
+                }), 404
+
+            # ---------------------------------------------------
+            # Valid real API data -- normal processing
+            # ---------------------------------------------------
+            df_filtered = df_filtered.copy()
+            df_filtered["hang_time"] = df_filtered["hang_time"].fillna(3.0)
+            df_filtered["outcome"] = df_filtered["outcome"].fillna("OUT")
+            df = df_filtered
+
+            # Resolve batter metadata: client payload first, then API lookup
+            if client_batter_name and client_batter_name.strip():
+                name = client_batter_name.strip()
+                raw_hand = client_batter_hand or "R"
+            else:
+                try:
+                    players = fetch_players(limit=5000)
+                    match = next(
+                        (p for p in players if p.get("player_id") == batter_id),
+                        None
+                    )
+                    if match:
+                        name = match.get("player_name") or f"Player {batter_id[:8]}"
+                        raw_hand = match.get("player_batting_handedness") or "R"
+                    else:
                         name = f"Player {batter_id[:8]}"
-                        bh = "R"
-                    else:
-                        meta = BATTERS[batter_id]
-                        name = meta["batter_name"]
-                        bh = meta["batter_hand"]
+                        raw_hand = "R"
+                except Exception:
+                    name = f"Player {batter_id[:8]}"
+                    raw_hand = "R"
 
-                    meta = {
-                        "label": f"{name} ({bh})",
-                        "batter_name": name,
-                        "batter_hand": bh
-                    }
+            if str(raw_hand).upper() in ("LEFT", "L"):
+                bh = "L"
+            elif str(raw_hand).upper() in ("RIGHT", "R"):
+                bh = "R"
+            else:
+                bh = "U"
 
-                    df_drawn = generate_spray("dickerson_R", pitcher_hand)
-                    df = df_drawn.copy()
-                    df["x"] = (df_drawn["x"] - 150) * 0.5
-                    df["y"] = (df_drawn["y"] - 200) * 2.0
-                    df["hang_time"] = df.get("hang_time", 3.0)
+            meta = {
+                "label": f"{name} ({bh})",
+                "batter_name": name,
+                "batter_hand": bh,
+                "player_id": batter_id
+            }
 
-                    positions_drawn = optimize_outfield(df_drawn)
-                    df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-                    df["outcome"] = df_drawn["outcome"].values[:len(df)]
-
-                # ---------------------------------------------------
-                # Valid real API data â€” normal processing
-                # ---------------------------------------------------
-                else:
-                    df_filtered["hang_time"] = df_filtered["hang_time"].fillna(3.0)
-                    df_filtered["outcome"] = df_filtered["outcome"].fillna("OUT")
-                    df = df_filtered
-
-                    # Determine batter metadata
-                    if client_batter_name and client_batter_name.strip():
-                        name = client_batter_name.strip()
-                        bh = client_batter_hand if client_batter_hand else "R"
-                    else:
-                        try:
-                            players = fetch_players(limit=5000)
-                            match = next(
-                                (p for p in players if p.get("player_id") == batter_id),
-                                None
-                            )
-                            if match:
-                                name = match.get("player_name") or f"Player {batter_id[:8]}"
-                                raw_hand = match.get("player_batting_handedness") or "R"
-                                if raw_hand.upper() in ["LEFT", "L"]:
-                                    bh = "L"
-                                elif raw_hand.upper() in ["RIGHT", "R"]:
-                                    bh = "R"
-                                else:
-                                    bh = "U"
-                            else:
-                                name = f"Player {batter_id[:8]}"
-                                bh = "R"
-                        except Exception:
-                            name = f"Player {batter_id[:8]}"
-                            bh = "R"
-
-                    meta = {
-                        "label": f"{name} ({bh})",
-                        "batter_name": name,
-                        "batter_hand": bh,
-                        "player_id": batter_id
-                    }
-
-                    positions_drawn = None  # handled later inside make_plot_with_image()
+            positions_drawn = None  # handled inside make_plot_with_image()
 
         # ---------------------------------------------------
         # MODE 2: JSON LOADER MODE
@@ -1245,7 +1310,7 @@ def api_compute():
             pitcher_hand=pitcher_hand,
             background_image_path=background_image_path
         )
-
+        
         return jsonify({
             "ok": True,
             "batter_id": batter_id,
@@ -1539,6 +1604,7 @@ def api_optimize_and_visualize(player_id: str):
         # -------------------------------------------------------
         batter_label = f"Player {player_id[:8]}"
 
+        
         img_b64 = make_plot_with_image(
             df_filtered,
             positions=positions_logical,
