@@ -493,8 +493,8 @@ def make_plot_with_image(
     #   HOME_X/Y_PX, LF/RF_POLE_X/Y_PX
     #     Define the fair-territory wedge. Dots outside this are dropped.
     # -------------------------------------------------------
-    OUTFIELD_TOP_PX    = 680    # ← fence / warning track row
-    OUTFIELD_BOTTOM_PX = 1100   # ← infield edge row
+    OUTFIELD_TOP_PX    = 720    # ← fence / warning track row
+    OUTFIELD_BOTTOM_PX = 930   # ← infield edge row
     HOME_X_PX    = 1170         # ← home plate X
     HOME_Y_PX    = 1600         # ← home plate Y (bottom of 1560px image)
     LF_POLE_X_PX =  248         # ← left foul pole X
@@ -547,7 +547,7 @@ def make_plot_with_image(
             pixel_y = int(OUTFIELD_BOTTOM_PX - depth_frac * (OUTFIELD_BOTTOM_PX - OUTFIELD_TOP_PX))
 
             # Direction fraction: -45° (LF) to +45° (RF) → 0.0 to 1.0
-            DIR_MIN, DIR_MAX = -45.0, 45.0
+            DIR_MIN, DIR_MAX = -38.0, 38.0
             dir_frac = (dir_f - DIR_MIN) / (DIR_MAX - DIR_MIN)
             dir_frac = max(0.0, min(1.0, dir_frac))
 
