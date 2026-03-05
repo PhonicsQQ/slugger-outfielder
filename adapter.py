@@ -36,6 +36,10 @@ HEADERS = {
 
 EXCLUDE_HIT_TYPES = {"groundball", "bunt"}
 
+# Minimum number of qualifying outfield balls a player must have
+# to appear in the dropdown menu AND to generate a spray chart.
+MIN_QUALIFYING_BALLS = 15
+
 
 def _normalize_pitch_call(value) -> str:
     """Collapse "InPlay", "in_play", "In Play" → "inplay"."""
@@ -395,42 +399,42 @@ def fetch_batted_balls(player_ids: Optional[List[str]] = None,
 
 def probe_player_has_data(player_id: str) -> bool:
     """
-    Check if a player has at least one qualifying outfield ball in play.
+    Check if a player has enough qualifying outfield balls in play.
 
     Uses the same filter logic as _is_outfield_ball() which mirrors
-    parse_spray_to_dataframe. Fetches up to 300 records per player to
-    avoid false negatives from sparse data.
+    parse_spray_to_dataframe. Fetches up to 500 records per player to
+    reduce false negatives from sparse data.
 
     Returns:
-        True if at least one outfield-qualifying record found.
+        True if at least MIN_QUALIFYING_BALLS outfield-qualifying records found.
     """
     url = f"{BASE_URL}/pitches"
-    # Fetch enough records to detect any players who have qualifying balls
-    # even if they mostly have ground balls or strikeouts early in the dataset.
-    PROBE_LIMIT = 300
+    PROBE_LIMIT = 500
 
     params = {
         "batter_id": player_id,
         "limit": PROBE_LIMIT,
-        # Pre-filter to in-play only at the API level — much faster probe.
         "pitch_call": "InPlay",
     }
 
     data = _get_with_retry(url, params, max_retries=1)
 
     if not data or not data.get("success"):
-        # On API failure, assume player might have data (don't exclude them)
         log.debug(f"probe: API failed for {player_id} — assuming has data")
         return True
 
     records = data.get("data", [])
 
-    for p in records:
-        if _is_outfield_ball(p):
-            return True
+    qualifying_count = sum(1 for p in records if _is_outfield_ball(p))
+
+    if qualifying_count >= MIN_QUALIFYING_BALLS:
+        log.debug(
+            f"probe: {player_id} — {qualifying_count} outfield balls (PASS)"
+        )
+        return True
 
     log.debug(
-        f"probe: {player_id} — checked {len(records)} records, "
-        f"0 outfield balls found"
+        f"probe: {player_id} — {qualifying_count}/{MIN_QUALIFYING_BALLS} "
+        f"outfield balls (FAIL, checked {len(records)} records)"
     )
     return False
