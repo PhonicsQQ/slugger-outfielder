@@ -234,7 +234,7 @@ def make_plot(df: pd.DataFrame,
     # Color map for outcomes
     color_map = {
         "1B": "#42a5f5",
-        "2B": "#66bb6a",
+        "2B": "#e040fb",
         "3B": "#ffa726",
         "OUT": "#bdbdbd"
     }
@@ -405,11 +405,11 @@ def make_plot_with_image(
     color_map = {
         "OUT": "#bdbdbd",
         "SINGLE": "#42a5f5",
-        "DOUBLE": "#66bb6a",
+        "DOUBLE": "#e040fb",
         "TRIPLE": "#ffa726",
         "HOMERUN": "#ef5350",
         "1B": "#42a5f5",
-        "2B": "#66bb6a",
+        "2B": "#e040fb",
         "3B": "#ffa726",
         "HR": "#ef5350",
     }
@@ -612,7 +612,7 @@ def make_plot_with_image(
         outcome_colors = {
             "OUT": "#bdbdbd",
             "SINGLE": "#42a5f5",
-            "DOUBLE": "#66bb6a",
+            "DOUBLE": "#e040fb",
         }
 
         new_balls = []
@@ -662,7 +662,7 @@ def make_plot_with_image(
         )
 
     # -------------------------------------------------------
-    # Legend (OUT, SINGLE, DOUBLE, TRIPLE)
+    # Legend (OUT, SINGLE, DOUBLE)
     # -------------------------------------------------------
     from matplotlib.patches import Patch
 
@@ -670,7 +670,6 @@ def make_plot_with_image(
         Patch(facecolor=color_map["OUT"], label="OUT"),
         Patch(facecolor=color_map["SINGLE"], label="SINGLE"),
         Patch(facecolor=color_map["DOUBLE"], label="DOUBLE"),
-        Patch(facecolor=color_map["TRIPLE"], label="TRIPLE"),
     ]
 
     ax.legend(
