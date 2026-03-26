@@ -588,7 +588,7 @@ def make_plot_with_image(
         cf_dots = sorted_dots[third:2*third]
         rf_dots = sorted_dots[2*third:]
 
-        SHALLOW_CUTOFF = 200.0
+        SHALLOW_CUTOFF = 220.0
         DEEP_CUTOFF    = 300.0
         SHALLOW_W      = 0.5
         MEDIUM_W       = 1.0
@@ -623,7 +623,7 @@ def make_plot_with_image(
     # the specific outcome, so positioning matters everywhere —
     # but the ceiling is realistic.
     # -------------------------------------------------------
-    SHALLOW_CUTOFF = 200.0
+    SHALLOW_CUTOFF = 220.0
     DEEP_CUTOFF    = 300.0
 
     if balls_pixel and optimized_pixel:
