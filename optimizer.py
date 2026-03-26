@@ -200,6 +200,59 @@ def calculate_date_weight(
 
 
 # -------------------------------------------------------
+# Depth-based importance weighting
+# -------------------------------------------------------
+# Deeper balls carry more positional leverage — mispositioning
+# on a 370-ft line drive is catastrophic (fly out vs triple),
+# while mispositioning on a 180-ft blooper barely matters
+# (single either way).  This function scales each ball's
+# contribution to the optimizer objective by its distance
+# from home plate.
+#
+# Default thresholds (in feet, matching Trackman "distance"):
+#   SHALLOW  < 200 ft  → weight 0.5  (low leverage)
+#   MEDIUM   200–300 ft → weight 1.0  (baseline)
+#   DEEP     > 300 ft  → weight 1.5  (high leverage)
+# -------------------------------------------------------
+
+DEPTH_WEIGHT_CONFIG = {
+    "shallow_cutoff": 200.0,   # feet — below this is a blooper
+    "deep_cutoff":    300.0,   # feet — above this is a deep fly
+    "shallow_weight":   0.5,
+    "medium_weight":    1.0,
+    "deep_weight":      1.5,
+}
+
+
+def calculate_depth_weight(
+    distance: float,
+    config: Optional[Dict] = None
+) -> float:
+    """
+    Compute depth-based importance weight for a batted ball.
+
+    Args:
+        distance: ball distance from home plate in feet
+        config: optional override for depth weight thresholds
+
+    Returns:
+        float: multiplier (< 1 for shallow, > 1 for deep)
+    """
+    if config is None:
+        config = DEPTH_WEIGHT_CONFIG
+
+    if distance <= 0 or np.isnan(distance):
+        return config["medium_weight"]
+
+    if distance < config["shallow_cutoff"]:
+        return config["shallow_weight"]
+    elif distance > config["deep_cutoff"]:
+        return config["deep_weight"]
+    else:
+        return config["medium_weight"]
+
+
+# -------------------------------------------------------
 # Excel Macro Optimization Engine
 # -------------------------------------------------------
 
@@ -239,6 +292,12 @@ def optimize_outfield_excel(
     ball_positions = list(zip(df["x"].values, df["y"].values))
     outcomes = df["outcome"].values
     hang_times = df["hang_time"].fillna(0).values
+
+    # Extract ball distances for depth-based weighting
+    if "distance" in df.columns:
+        ball_distances = pd.to_numeric(df["distance"], errors="coerce").fillna(0).values
+    else:
+        ball_distances = np.zeros(len(df))
 
     # Build grid ranges
     rf_x_range = range(grid_params["RF"]["min_x"], grid_params["RF"]["max_x"] + 1, grid_params["RF"]["step_x"])
@@ -292,7 +351,10 @@ def optimize_outfield_excel(
                                     weight_idx = min(i, len(weights) - 1)
                                     weight = weights[weight_idx]
 
-                                total += weight * best_penalty
+                                # Apply depth-based importance weight
+                                depth_weight = calculate_depth_weight(ball_distances[i])
+
+                                total += weight * depth_weight * best_penalty
 
                             # Track best combination
                             if total < best_total:

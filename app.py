@@ -569,11 +569,12 @@ def make_plot_with_image(
            
 
             color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
-            balls_pixel.append((pixel_x, pixel_y, color))
+            balls_pixel.append((pixel_x, pixel_y, color, dist_f))
 
     # -------------------------------------------------------
     # Calculate optimized fielder positions from spray dot locations
-    # Place each fielder at the centroid of spray dots in their zone
+    # Place each fielder at the depth-weighted centroid of spray dots
+    # in their zone — deeper balls pull the fielder back harder.
     # -------------------------------------------------------
     optimized_pixel = {}
 
@@ -587,21 +588,49 @@ def make_plot_with_image(
         cf_dots = sorted_dots[third:2*third]
         rf_dots = sorted_dots[2*third:]
 
+        SHALLOW_CUTOFF = 200.0
+        DEEP_CUTOFF    = 300.0
+        SHALLOW_W      = 0.5
+        MEDIUM_W       = 1.0
+        DEEP_W         = 1.5
+
         for name, dots in [("LF", lf_dots), ("CF", cf_dots), ("RF", rf_dots)]:
             if dots:
-                avg_x = sum(d[0] for d in dots) / len(dots)
-                avg_y = sum(d[1] for d in dots) / len(dots)
-                optimized_pixel[name] = (avg_x, avg_y)
+                total_w = 0.0
+                wx_sum = 0.0
+                wy_sum = 0.0
+                for (px, py, _, dist) in dots:
+                    if dist < SHALLOW_CUTOFF:
+                        w = SHALLOW_W
+                    elif dist > DEEP_CUTOFF:
+                        w = DEEP_W
+                    else:
+                        w = MEDIUM_W
+                    wx_sum += w * px
+                    wy_sum += w * py
+                    total_w += w
+                optimized_pixel[name] = (wx_sum / total_w, wy_sum / total_w)
 
     # -------------------------------------------------------
-    # Reassign outcomes based on pixel-space distance to nearest fielder
-    # Outs cluster around fielders, hits land in gaps
+    # Reassign outcomes: depth-aware with outcome caps
+    #
+    # Shallow balls (< 200 ft) are capped at SINGLE — they
+    # don't have the energy to roll past a charging outfielder.
+    # Medium balls (200-300 ft) can be OUT/SINGLE/DOUBLE.
+    # Deep balls (300+ ft) get the full outcome range.
+    #
+    # Within each depth band, fielder proximity still determines
+    # the specific outcome, so positioning matters everywhere —
+    # but the ceiling is realistic.
     # -------------------------------------------------------
+    SHALLOW_CUTOFF = 200.0
+    DEEP_CUTOFF    = 300.0
+
     if balls_pixel and optimized_pixel:
         fielder_positions = list(optimized_pixel.values())
         min_dists = []
 
-        for (px, py, _) in balls_pixel:
+        for (px, py, _, _) in balls_pixel:
             d = min(np.hypot(px - fx, py - fy) for fx, fy in fielder_positions)
             min_dists.append(d)
 
@@ -616,13 +645,29 @@ def make_plot_with_image(
         }
 
         new_balls = []
-        for i, (px, py, _) in enumerate(balls_pixel):
+        for i, (px, py, _, dist) in enumerate(balls_pixel):
+            # Base outcome from fielder proximity (same as before)
             if min_dists[i] <= p65:
-                outcome = "OUT"
+                base_outcome = "OUT"
             elif min_dists[i] <= p90:
-                outcome = "SINGLE"
+                base_outcome = "SINGLE"
             else:
-                outcome = "DOUBLE"
+                base_outcome = "DOUBLE"
+
+            # Apply depth-based outcome cap
+            if dist < SHALLOW_CUTOFF:
+                # Shallow blooper — capped at SINGLE
+                if base_outcome == "DOUBLE":
+                    outcome = "SINGLE"
+                else:
+                    outcome = base_outcome
+            elif dist < DEEP_CUTOFF:
+                # Medium depth — full OUT/SINGLE/DOUBLE range
+                outcome = base_outcome
+            else:
+                # Deep ball — full range (DOUBLE is realistic here)
+                outcome = base_outcome
+
             new_balls.append((px, py, outcome_colors[outcome]))
 
         balls_pixel = new_balls
