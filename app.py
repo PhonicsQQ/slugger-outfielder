@@ -588,7 +588,7 @@ def make_plot_with_image(
         cf_dots = sorted_dots[third:2*third]
         rf_dots = sorted_dots[2*third:]
 
-        SHALLOW_CUTOFF = 220.0
+        SHALLOW_CUTOFF = 200.0
         DEEP_CUTOFF    = 300.0
         SHALLOW_W      = 0.5
         MEDIUM_W       = 1.0
@@ -623,7 +623,7 @@ def make_plot_with_image(
     # the specific outcome, so positioning matters everywhere —
     # but the ceiling is realistic.
     # -------------------------------------------------------
-    SHALLOW_CUTOFF = 220.0
+    SHALLOW_CUTOFF = 200.0
     DEEP_CUTOFF    = 300.0
 
     if balls_pixel and optimized_pixel:
@@ -1120,6 +1120,84 @@ def api_cache_status():
         "probed": len(_players_with_data_cache),
         "total": len(players)
     })
+
+
+@app.route("/api/batters", methods=["GET"])
+def api_batters():
+    """
+    Return the player list as JSON for the React frontend.
+    Reuses the same loading logic as the index route.
+    """
+    batters = {}
+
+    if USE_JSON_LOADER:
+        try:
+            players_with_data = get_unique_players_with_spray_data()
+            seen_names = set()
+            for player in players_with_data:
+                player_id = player.get("player_id")
+                player_name = player.get("player_name", "Unknown")
+                batting_hand = (player.get("player_batting_handedness") or "").upper()
+                if batting_hand in ["LEFT", "L"]:
+                    hand_suffix = "L"
+                elif batting_hand in ["RIGHT", "R"]:
+                    hand_suffix = "R"
+                else:
+                    hand_suffix = "U"
+                name_clean = player_name.strip()
+                if not name_clean or len(name_clean) < 2:
+                    continue
+                if name_clean.startswith(",") or not re.search(r"[a-zA-Z0-9]", name_clean):
+                    continue
+                key_pair = (name_clean, hand_suffix)
+                if key_pair in seen_names:
+                    continue
+                seen_names.add(key_pair)
+                batters[player_id] = {
+                    "label": f"{name_clean} ({hand_suffix})",
+                    "batter_name": name_clean,
+                    "batter_hand": hand_suffix,
+                    "player_id": player_id,
+                }
+        except Exception:
+            log.exception("Failed to load batters for API")
+
+    elif USE_API_ADAPTER:
+        try:
+            players = fetch_players(limit=1000)
+            seen_names = set()
+            for player in players:
+                player_id = player.get("player_id")
+                player_name = (player.get("player_name") or "").strip()
+                if not player_id or not player_name or len(player_name) < 2:
+                    continue
+                if player_name.startswith(",") or not re.search(r"[a-zA-Z0-9]", player_name):
+                    continue
+                batting_hand = (player.get("player_batting_handedness") or "").upper()
+                if batting_hand in ("LEFT", "L"):
+                    hand = "L"
+                elif batting_hand in ("RIGHT", "R"):
+                    hand = "R"
+                else:
+                    hand = "U"
+                key_pair = (player_name, hand)
+                if key_pair in seen_names:
+                    continue
+                seen_names.add(key_pair)
+                batters[player_id] = {
+                    "label": f"{player_name} ({hand})",
+                    "batter_name": player_name,
+                    "batter_hand": hand,
+                    "player_id": player_id,
+                }
+        except Exception:
+            log.exception("Failed to load batters from API")
+
+    if not batters:
+        batters = BATTERS
+
+    return jsonify({"ok": True, "batters": batters})
+
 
 @app.route("/api/compute", methods=["POST"])
 def api_compute():
