@@ -1,4 +1,4 @@
-# app.py — Outfield Positioning Optimizer Demo (drawn field)
+# app.py — SLUGGER Outfield Positioning Optimizer
 # -*- coding: utf-8 -*-
 
 import io
@@ -7,47 +7,47 @@ import sys
 import os
 import re
 import logging
-from typing import Dict, Tuple, Optional
-from dotenv import load_dotenv
+import threading
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-# Load .env file for environment variables
+from dotenv import load_dotenv
 load_dotenv()
 
-# Fix UTF-8 encoding issues for Windows terminals
-if sys.platform == 'win32':
-    if hasattr(sys.stdout, 'buffer'):
-        sys.stdout = io.TextIOWrapper(
-            sys.stdout.buffer,
-            encoding='utf-8',
-            errors='replace',
-            line_buffering=True
-        )
-    if hasattr(sys.stderr, 'buffer'):
-        sys.stderr = io.TextIOWrapper(
-            sys.stderr.buffer,
-            encoding='utf-8',
-            errors='replace',
-            line_buffering=True
-        )
+# ── Windows UTF-8 fix ────────────────────────────────────
+if sys.platform == "win32":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "buffer"):
+            setattr(
+                sys,
+                stream.name,
+                io.TextIOWrapper(stream.buffer, encoding="utf-8",
+                                 errors="replace", line_buffering=True),
+            )
 
-from flask import Flask, request, jsonify, render_template_string, render_template, send_file
+# ── Core imports ─────────────────────────────────────────
+from flask import Flask, request, jsonify, render_template, send_file
 import numpy as np
 import pandas as pd
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon, Rectangle
+from matplotlib.patches import Polygon, Rectangle, Arc, Patch
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 log = logging.getLogger(__name__)
 
-
 app = Flask(__name__)
 
-# -------------------------------------------------------
-# CONFIG: Hardcoded demo batters (used when real data unavailable)
-# -------------------------------------------------------
+# ═════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═════════════════════════════════════════════════════════
+
+LAST_CSV_PATH = "optimized_positions.csv"
+DEFAULT_BACKGROUND = "img/background.png"
+
 BATTERS: Dict[str, Dict] = {
     "dickerson_L": {
         "label": "Corey Dickerson (L)",
@@ -61,97 +61,229 @@ BATTERS: Dict[str, Dict] = {
     },
 }
 
-LAST_CSV_PATH = "optimized_positions.csv"
+# Pixel calibration for background image spray mapping
+SPRAY_PIXEL_CONFIG = {
+    "outfield_top_px":    720,
+    "outfield_bottom_px": 930,
+    "home_x_px":          1170,
+    "home_y_px":          1600,
+    "lf_pole_x_px":       248,
+    "lf_pole_y_px":       848,
+    "rf_pole_x_px":       2114,
+    "rf_pole_y_px":       854,
+    "dist_min":           150.0,
+    "dist_max":           400.0,
+    "dir_min":            -38.0,
+    "dir_max":            38.0,
+}
 
-# -------------------------------------------------------
-# SYNTHETIC SPRAY GENERATION (used when API/JSON data unavailable)
-# -------------------------------------------------------
-def generate_spray(batter_id: str, pitcher_hand: str) -> pd.DataFrame:
+OUTCOME_COLORS = {
+    "OUT": "#bdbdbd", "SINGLE": "#42a5f5", "DOUBLE": "#e040fb",
+    "TRIPLE": "#ffa726", "HOMERUN": "#ef5350",
+    "1B": "#42a5f5", "2B": "#e040fb", "3B": "#ffa726", "HR": "#ef5350",
+}
+
+
+# ═════════════════════════════════════════════════════════
+#  DATA SOURCE DETECTION
+# ═════════════════════════════════════════════════════════
+
+USE_API_MODE_ENV = os.getenv("USE_API_MODE", "false")
+USE_API_MODE = USE_API_MODE_ENV.lower() == "true"
+
+# JSON loader
+USE_JSON_LOADER = False
+if not USE_API_MODE:
+    try:
+        from data_loader import (
+            load_players,
+            get_player_spray_dataframe,
+            get_unique_players_with_spray_data,
+            filter_players_by_handedness,
+            parse_spray_to_dataframe,
+        )
+        USE_JSON_LOADER = True
+    except ImportError:
+        pass
+
+# API adapter
+USE_API_ADAPTER = False
+MIN_QUALIFYING_BALLS = 15
+try:
+    from adapter import (
+        fetch_ballparks, fetch_games, fetch_player_spray,
+        fetch_players, MIN_QUALIFYING_BALLS,
+    )
+    USE_API_ADAPTER = True
+except ImportError:
+    pass
+
+# Excel-based optimizer
+USE_EXCEL_ALGORITHM = False
+try:
+    from optimizer import optimize_outfield_excel
+    USE_EXCEL_ALGORITHM = True
+except ImportError:
+    pass
+
+log.info("=" * 60)
+log.info("Data mode: %s",
+         "API Adapter" if (USE_API_ADAPTER and not USE_JSON_LOADER)
+         else "JSON Loader" if USE_JSON_LOADER
+         else "Synthetic Fallback")
+log.info("Min qualifying balls: %d", MIN_QUALIFYING_BALLS)
+log.info("=" * 60)
+
+
+# ═════════════════════════════════════════════════════════
+#  SHARED HELPERS
+# ═════════════════════════════════════════════════════════
+
+def normalize_hand(raw: str) -> str:
+    """Normalize batting/pitching handedness to single letter."""
+    raw = str(raw).strip().upper()
+    if raw in ("LEFT", "L"):
+        return "L"
+    if raw in ("RIGHT", "R"):
+        return "R"
+    return "U"
+
+
+def is_valid_player_name(name: str) -> bool:
+    """Return True if name is usable for display."""
+    name = name.strip()
+    if not name or len(name) < 2:
+        return False
+    if name.startswith(",") or name == ",":
+        return False
+    if not re.search(r"[a-zA-Z0-9]", name):
+        return False
+    return True
+
+
+def build_player_dict(players: list) -> Dict[str, Dict]:
     """
-    Generate synthetic spray data based on batter handedness and pitcher handedness.
-    Uses a mixture of clusters to create realistic spray patterns with gaps and variation.
+    Convert a list of player records into the batter dict format
+    used by the frontend.  Deduplicates by (name, hand).
     """
-    if batter_id in BATTERS:
-        meta = BATTERS[batter_id]
-        bhand = meta["batter_hand"]
+    result = {}
+    seen = set()
+    for p in players:
+        pid = p.get("player_id")
+        if not pid:
+            continue
+        name = (p.get("player_name") or "").strip()
+        if not is_valid_player_name(name):
+            continue
+        hand = normalize_hand(p.get("player_batting_handedness") or "")
+        key_pair = (name, hand)
+        if key_pair in seen:
+            continue
+        seen.add(key_pair)
+        result[str(pid)] = {
+            "label": f"{name} ({hand})",
+            "batter_name": name,
+            "batter_hand": hand,
+            "player_id": pid,
+        }
+    return result
+
+
+def resolve_batter_meta(batter_id: str,
+                        client_name: Optional[str] = None,
+                        client_hand: Optional[str] = None) -> Dict:
+    """
+    Resolve a batter's display metadata.
+    Priority: client-provided → API lookup → fallback.
+    """
+    if client_name and client_name.strip():
+        name = client_name.strip()
+        hand = normalize_hand(client_hand or "R")
+    elif USE_API_ADAPTER:
+        try:
+            players = fetch_players(limit=5000)
+            match = next((p for p in players
+                          if p.get("player_id") == batter_id), None)
+            if match:
+                name = match.get("player_name") or f"Player {batter_id[:8]}"
+                hand = normalize_hand(
+                    match.get("player_batting_handedness") or "R")
+            else:
+                name, hand = f"Player {batter_id[:8]}", "R"
+        except Exception:
+            name, hand = f"Player {batter_id[:8]}", "R"
     else:
-        bhand = "R"
+        name, hand = f"Player {batter_id[:8]}", "R"
 
+    return {
+        "label": f"{name} ({hand})",
+        "batter_name": name,
+        "batter_hand": hand,
+        "player_id": batter_id,
+    }
+
+
+def _prepare_synthetic(batter_id: str, pitcher_hand: str):
+    """
+    Build synthetic spray DataFrame + positions for fallback mode.
+    Returns (df, positions_drawn).
+    """
+    df_drawn = generate_spray(batter_id, pitcher_hand)
+    df = df_drawn.copy()
+    df["x"] = (df_drawn["x"] - 150) * 0.5
+    df["y"] = (df_drawn["y"] - 200) * 2.0
+    df["hang_time"] = 3.0
+    positions_drawn = optimize_outfield(df_drawn)
+    df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+    df["outcome"] = df_drawn["outcome"].values[: len(df)]
+    return df, positions_drawn
+
+
+# ═════════════════════════════════════════════════════════
+#  SYNTHETIC SPRAY GENERATION
+# ═════════════════════════════════════════════════════════
+
+def generate_spray(batter_id: str, pitcher_hand: str) -> pd.DataFrame:
+    """Generate synthetic spray clusters for demo/fallback."""
+    bhand = BATTERS[batter_id]["batter_hand"] if batter_id in BATTERS else "R"
     seed = abs(hash(batter_id + "_" + pitcher_hand)) % (2**32)
     rng = np.random.default_rng(seed)
     n = 150
 
-    # Create multiple spray clusters for realistic scatter
-    # Each cluster: (center_x, center_y, std_x, std_y, count)
-    if bhand == "L" and pitcher_hand == "RHP":
-        clusters = [
-            (200, 320, 30, 30, 45),   # pull side RF gap
-            (170, 290, 25, 35, 35),   # right-center
-            (150, 340, 20, 25, 25),   # straightaway CF deep
-            (120, 280, 30, 30, 25),   # left-center
-            (90, 310, 25, 25, 20),    # opposite field LF
-        ]
-    elif bhand == "L" and pitcher_hand == "LHP":
-        clusters = [
-            (150, 310, 35, 30, 40),   # center
-            (180, 290, 25, 35, 30),   # right-center
-            (110, 300, 30, 30, 30),   # left-center
-            (200, 330, 20, 20, 25),   # RF line
-            (80, 320, 20, 25, 25),    # LF line
-        ]
-    elif bhand == "R" and pitcher_hand == "LHP":
-        clusters = [
-            (100, 320, 30, 30, 45),   # pull side LF gap
-            (130, 290, 25, 35, 35),   # left-center
-            (150, 340, 20, 25, 25),   # straightaway CF deep
-            (180, 280, 30, 30, 25),   # right-center
-            (210, 310, 25, 25, 20),   # opposite field RF
-        ]
-    else:  # R vs RHP
-        clusters = [
-            (150, 310, 35, 30, 35),   # center
-            (120, 290, 25, 35, 30),   # left-center
-            (190, 300, 30, 30, 30),   # right-center
-            (100, 330, 20, 20, 25),   # LF line
-            (210, 320, 20, 25, 30),   # RF line
-        ]
+    cluster_map = {
+        ("L", "RHP"): [(200,320,30,30,45),(170,290,25,35,35),(150,340,20,25,25),(120,280,30,30,25),(90,310,25,25,20)],
+        ("L", "LHP"): [(150,310,35,30,40),(180,290,25,35,30),(110,300,30,30,30),(200,330,20,20,25),(80,320,20,25,25)],
+        ("R", "LHP"): [(100,320,30,30,45),(130,290,25,35,35),(150,340,20,25,25),(180,280,30,30,25),(210,310,25,25,20)],
+        ("R", "RHP"): [(150,310,35,30,35),(120,290,25,35,30),(190,300,30,30,30),(100,330,20,20,25),(210,320,20,25,30)],
+    }
+    clusters = cluster_map.get((bhand, pitcher_hand), cluster_map[("R", "RHP")])
 
-    all_x = []
-    all_y = []
+    xs, ys = [], []
     for cx, cy, sx, sy, count in clusters:
-        all_x.append(rng.normal(cx, sx, count))
-        all_y.append(rng.normal(cy, sy, count))
+        xs.append(rng.normal(cx, sx, count))
+        ys.append(rng.normal(cy, sy, count))
 
-    x = np.concatenate(all_x)
-    y = np.concatenate(all_y)
-
-    # Shuffle to mix clusters
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
     idx = rng.permutation(len(x))
-    x = x[idx][:n]
-    y = y[idx][:n]
-
-    x = np.clip(x, 50, 250)
-    y = np.clip(y, 230, 400)
+    x = np.clip(x[idx][:n], 50, 250)
+    y = np.clip(y[idx][:n], 230, 400)
 
     return pd.DataFrame({"x": x, "y": y})
 
-# -------------------------------------------------------
-# BASIC OPTIMIZATION (grid search for LF/CF/RF positions)
-# -------------------------------------------------------
+
+# ═════════════════════════════════════════════════════════
+#  BASIC OPTIMIZER (grid search)
+# ═════════════════════════════════════════════════════════
+
 def optimize_outfield(df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
-    """
-    Perform brute-force search over predefined LF/CF/RF grids
-    to minimize total distance from each batted ball to the nearest fielder.
-    """
+    """Brute-force grid search for LF / CF / RF positions."""
     lf_grid = [(x, y) for x in range(70, 120, 10) for y in range(260, 330, 10)]
     cf_grid = [(x, y) for x in range(120, 180, 10) for y in range(310, 380, 10)]
     rf_grid = [(x, y) for x in range(180, 230, 10) for y in range(260, 330, 10)]
 
-    bx = df["x"].to_numpy()
-    by = df["y"].to_numpy()
-
-    best_score = float("inf")
-    best = {}
+    bx, by = df["x"].to_numpy(), df["y"].to_numpy()
+    best_score, best = float("inf"), {}
 
     for lf in lf_grid:
         dlf = np.hypot(bx - lf[0], by - lf[1])
@@ -159,1789 +291,834 @@ def optimize_outfield(df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
             dcf = np.hypot(bx - cf[0], by - cf[1])
             for rf in rf_grid:
                 drf = np.hypot(bx - rf[0], by - rf[1])
-                dist_min = np.minimum(np.minimum(dlf, dcf), drf)
-                total_distance = dist_min.sum()
-                if total_distance < best_score:
-                    best_score = total_distance
+                score = np.minimum(np.minimum(dlf, dcf), drf).sum()
+                if score < best_score:
+                    best_score = score
                     best = {"LF": lf, "CF": cf, "RF": rf}
-
     return best
 
 
-def assign_distance_based_outcomes(df: pd.DataFrame, positions: Dict[str, Tuple[float, float]]) -> pd.DataFrame:
-    """
-    Assign realistic outcomes based on distance from each ball to the nearest fielder.
-    Balls close to fielders are outs, farther balls are singles, very far balls are doubles.
-    """
-    bx = df["x"].to_numpy()
-    by = df["y"].to_numpy()
+def assign_distance_based_outcomes(
+    df: pd.DataFrame,
+    positions: Dict[str, Tuple[float, float]],
+) -> pd.DataFrame:
+    """Label each ball as OUT / SINGLE / DOUBLE by proximity to fielders."""
+    bx, by = df["x"].to_numpy(), df["y"].to_numpy()
+    dists = [np.hypot(bx - fx, by - fy) for _, (fx, fy) in positions.items()]
+    min_dist = np.minimum.reduce(dists)
+    p65, p90 = np.percentile(min_dist, 65), np.percentile(min_dist, 90)
 
-    # Calculate distance to nearest fielder
-    distances = []
-    for name, (fx, fy) in positions.items():
-        d = np.hypot(bx - fx, by - fy)
-        distances.append(d)
-    min_dist = np.minimum.reduce(distances)
-
-    # Assign outcomes based on distance thresholds
-    # Most outfield balls are caught - outs should dominate
-    p65 = np.percentile(min_dist, 65)
-    p90 = np.percentile(min_dist, 90)
-
-    outcomes = []
-    for d in min_dist:
-        if d <= p65:
-            outcomes.append("OUT")
-        elif d <= p90:
-            outcomes.append("SINGLE")
-        else:
-            outcomes.append("DOUBLE")
-    
     df = df.copy()
-    df["outcome"] = outcomes
+    df["outcome"] = np.where(
+        min_dist <= p65, "OUT",
+        np.where(min_dist <= p90, "SINGLE", "DOUBLE"),
+    )
     return df
 
 
-# -------------------------------------------------------
-# PLOTTING FUNCTION (drawn field visualization)
-# -------------------------------------------------------
-from matplotlib.patches import Polygon, Rectangle, Circle, Arc
+# ═════════════════════════════════════════════════════════
+#  VISUALIZATION — Drawn field (fallback)
+# ═════════════════════════════════════════════════════════
 
-def make_plot(df: pd.DataFrame,
-              positions: Dict[str, Tuple[float, float]],
-              batter_label: str,
-              pitcher_hand: str) -> str:
-    """
-    Draw a baseball field and overlay spray data and optimized fielder positions.
-    """
-    # Identify an outcome column if available
-    outcome_col = None
+def _find_outcome_col(df: pd.DataFrame) -> str:
+    """Find or create an outcome column in df."""
     for c in df.columns:
         if c.lower() in ("result", "outcome", "event"):
-            outcome_col = c
-            break
-
-    # If no outcomes provided, generate synthetic labels
-    if outcome_col is None:
-        rng = np.random.default_rng(0)
-        labels = np.array(["1B", "2B", "3B", "OUT"])
-        df["outcome"] = rng.choice(
-            labels, size=len(df),
-            p=[0.55, 0.25, 0.03, 0.17]
-        )
-        outcome_col = "outcome"
-
-    # Color map for outcomes
-    color_map = {
-        "1B": "#42a5f5",
-        "2B": "#e040fb",
-        "3B": "#ffa726",
-        "OUT": "#bdbdbd"
-    }
-    spray_colors = df[outcome_col].map(
-        lambda v: color_map.get(str(v).upper(), "white")
+            return c
+    rng = np.random.default_rng(0)
+    df["outcome"] = rng.choice(
+        ["1B", "2B", "3B", "OUT"], size=len(df),
+        p=[0.55, 0.25, 0.03, 0.17],
     )
+    return "outcome"
 
-    # Create figure
+
+def make_plot(
+    df: pd.DataFrame,
+    positions: Optional[Dict[str, Tuple[float, float]]],
+    batter_label: str,
+    pitcher_hand: str,
+) -> str:
+    """Draw a synthetic field and overlay spray data. Returns base64 PNG."""
+    outcome_col = _find_outcome_col(df)
+    spray_colors = df[outcome_col].map(
+        lambda v: OUTCOME_COLORS.get(str(v).upper(), "white"))
+
     fig, ax = plt.subplots(figsize=(10, 7))
-    ax.set_facecolor("#144d14")  # grass color
+    ax.set_facecolor("#144d14")
 
     home = (150, 200)
-    left_line = (60, 250)
-    right_line = (240, 250)
+    left_line, right_line = (60, 250), (240, 250)
 
-    # Draw outfield fence arc
-    fence_radius = 180
-    fence_arc = Arc(
-        home,
-        width=fence_radius * 2,
-        height=fence_radius * 2,
-        theta1=22, theta2=158,
-        edgecolor="white",
-        linewidth=2, zorder=1
-    )
-    ax.add_patch(fence_arc)
+    # Fence arc
+    fence_r = 180
+    ax.add_patch(Arc(home, fence_r*2, fence_r*2,
+                     theta1=22, theta2=158,
+                     edgecolor="white", linewidth=2, zorder=1))
 
-    # Outfield grass polygon
-    fence_points = []
-    for angle in np.linspace(22, 158, 30):
-        rad = np.radians(angle)
-        px = home[0] + fence_radius * np.cos(rad)
-        py = home[1] + fence_radius * np.sin(rad)
-        fence_points.append((px, py))
+    # Outfield grass
+    pts = [(home[0] + fence_r*np.cos(np.radians(a)),
+            home[1] + fence_r*np.sin(np.radians(a)))
+           for a in np.linspace(22, 158, 30)]
+    ax.add_patch(Polygon([left_line] + pts + [right_line],
+                         closed=True, facecolor="#1c6b1c",
+                         edgecolor="none", zorder=0))
 
-    outfield_poly = Polygon(
-        [left_line] + fence_points + [right_line],
-        closed=True,
-        facecolor="#1c6b1c",
-        edgecolor="none",
-        zorder=0
-    )
-    ax.add_patch(outfield_poly)
+    # Infield dirt
+    ax.add_patch(Arc(home, 190, 190, theta1=22, theta2=158,
+                     edgecolor="#c49a6c", linewidth=25, zorder=2))
 
-    # Infield dirt arc
-    dirt_radius = 95
-    dirt_arc = Arc(
-        home,
-        width=dirt_radius * 2,
-        height=dirt_radius * 2,
-        theta1=22, theta2=158,
-        edgecolor="#c49a6c",
-        linewidth=25, zorder=2
-    )
-    ax.add_patch(dirt_arc)
+    # Diamond
+    ax.add_patch(Polygon([(150,200),(170,220),(150,240),(130,220)],
+                         closed=True, facecolor="#c49a6c",
+                         edgecolor="white", linewidth=2, zorder=3))
 
-    # Basepath shape
-    basepath = Polygon(
-        [
-            (150, 200),
-            (170, 220),
-            (150, 240),
-            (130, 220)
-        ],
-        closed=True,
-        facecolor="#c49a6c",
-        edgecolor="white",
-        linewidth=2,
-        zorder=3
-    )
-    ax.add_patch(basepath)
-
-    # Baselines
-    ax.plot([home[0], left_line[0]], [home[1], left_line[1]],
-            color="white", linewidth=2, zorder=4)
-    ax.plot([home[0], right_line[0]], [home[1], right_line[1]],
-            color="white", linewidth=2, zorder=4)
-
-    # Centerline
-    ax.plot([150, 150], [250, 380],
-            color="white", linestyle="--",
-            linewidth=1.2, alpha=0.6, zorder=4)
+    # Baselines + centerline
+    for end in (left_line, right_line):
+        ax.plot([home[0], end[0]], [home[1], end[1]],
+                color="white", linewidth=2, zorder=4)
+    ax.plot([150, 150], [250, 380], color="white",
+            linestyle="--", linewidth=1.2, alpha=0.6, zorder=4)
 
     # Spray dots
-    ax.scatter(
-        df["x"], df["y"],
-        c=spray_colors, s=30, alpha=0.8,
-        edgecolor="none", zorder=5
-    )
+    ax.scatter(df["x"], df["y"], c=spray_colors, s=30,
+               alpha=0.8, edgecolor="none", zorder=5)
 
-    # Draw optimized LF/CF/RF boxes
-    box_w, box_h = 12, 12
+    # Fielder markers
+    box = 12
     for name, (cx, cy) in (positions or {}).items():
-        rect = Rectangle(
-            (cx - box_w/2, cy - box_h/2),
-            box_w, box_h,
-            linewidth=2, edgecolor="red",
-            facecolor="none", zorder=7
-        )
-        ax.add_patch(rect)
-
+        ax.add_patch(Rectangle((cx - box/2, cy - box/2), box, box,
+                               linewidth=2, edgecolor="red",
+                               facecolor="none", zorder=7))
         ax.scatter(cx, cy, c="red", s=70, zorder=8)
-
-        ax.text(
-            cx, cy + box_h + 3,
-            name, color="red",
-            fontsize=10, ha="center",
-            va="bottom", weight="bold",
-            zorder=9
-        )
+        ax.text(cx, cy + box + 3, name, color="red",
+                fontsize=10, ha="center", va="bottom",
+                weight="bold", zorder=9)
 
     ax.set_xlim(40, 260)
     ax.set_ylim(200, 420)
     ax.axis("off")
+    ax.set_title(f"{batter_label} vs {pitcher_hand}",
+                 color="white", fontsize=16, pad=12)
 
-    ax.set_title(
-        f"{batter_label} vs {pitcher_hand}",
-        color="white", fontsize=16, pad=12
-    )
-
-    # Export as base64 image
     buf = io.BytesIO()
     plt.savefig(buf, format="png", bbox_inches="tight")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+# ═════════════════════════════════════════════════════════
+#  VISUALIZATION — Background image (production)
+# ═════════════════════════════════════════════════════════
+
 def make_plot_with_image(
     df: pd.DataFrame,
     positions: Optional[Dict[str, Tuple[float, float]]] = None,
     batter_label: str = "Test Player",
     pitcher_hand: str = "RHP",
-    background_image_path: str = "img/background.avif"
+    background_image_path: str = DEFAULT_BACKGROUND,
 ) -> str:
     """
-    Visualization using a real ballpark background image (Phase 3 workflow).
-
-    Args:
-        df: DataFrame containing spray coordinates and outcomes.
-        positions: Optional optimized outfielder positions in logical coordinates.
-        batter_label: Display label for hitter.
-        pitcher_hand: String label ("RHP" or "LHP").
-        background_image_path: Path to the field background image.
-
-    Returns:
-        Base64-encoded PNG containing the rendered spray and field layout.
+    Render spray chart over a real ballpark photo.
+    Falls back to make_plot() if image/config unavailable.
     """
     from PIL import Image
 
-    # -------------------------------------------------------
-    # Determine outcome labels & colors
-    # -------------------------------------------------------
-    outcome_col = None
-    for c in df.columns:
-        if c.lower() in ("result", "outcome", "event"):
-            outcome_col = c
-            break
-
-    if outcome_col is None:
-        outcome_col = "outcome"
-        if "outcome" not in df.columns:
-            rng = np.random.default_rng(42)
-            df["outcome"] = rng.choice(
-                ["OUT", "SINGLE", "DOUBLE"],
-                size=len(df), p=[0.55, 0.30, 0.15]
-            )
-
-    color_map = {
-        "OUT": "#bdbdbd",
-        "SINGLE": "#42a5f5",
-        "DOUBLE": "#e040fb",
-        "TRIPLE": "#ffa726",
-        "HOMERUN": "#ef5350",
-        "1B": "#42a5f5",
-        "2B": "#e040fb",
-        "3B": "#ffa726",
-        "HR": "#ef5350",
-    }
-
+    # Outcome colours
+    outcome_col = _find_outcome_col(df)
     spray_colors = df[outcome_col].map(
-        lambda v: color_map.get(str(v).upper(), "#ffffff")
-    )
+        lambda v: OUTCOME_COLORS.get(str(v).upper(), "#ffffff"))
 
-    # -------------------------------------------------------
-    # Load background image
-    # -------------------------------------------------------
+    # Load background
     try:
         img = Image.open(background_image_path)
         if img.mode != "RGB":
             img = img.convert("RGB")
         img_array = np.array(img)
     except Exception as e:
-        log.warning(f"Could not load background image: {e}. Falling back to drawn field.")
+        log.warning("Background image failed (%s) — using drawn field.", e)
         return make_plot(df, positions, batter_label, pitcher_hand)
 
-    # -------------------------------------------------------
-    # Load outfield polygon + affine transforms
-    # -------------------------------------------------------
+    # Load outfield region manager
     outfield_manager = None
     try:
         from outfield_region import OutfieldRegionManager
-        from pathlib import Path
-
         config_path = "outfield_region_config.json"
         if Path(config_path).exists():
             outfield_manager = OutfieldRegionManager(config_path)
     except Exception as e:
-        print(f"[OutfieldRegion] Failed to load region config (ignored): {e}")
+        log.warning("OutfieldRegionManager load failed: %s", e)
 
     if not outfield_manager:
-        log.warning("OutfieldRegionManager unavailable — coordinate transforms disabled.")
         return make_plot(df, positions, batter_label, pitcher_hand)
 
-    # Image dimensions
-    img_height, img_width = img_array.shape[:2]
-    original_width = img_width
-    original_height = img_height
+    img_h, img_w = img_array.shape[:2]
+    cfg = SPRAY_PIXEL_CONFIG
 
-    # -------------------------------------------------------
-    # Render figure with pixel-based axes
-    # -------------------------------------------------------
-    target_dpi = 150
-    figsize_width = original_width / target_dpi
-    figsize_height = original_height / target_dpi
-
-    fig, ax = plt.subplots(figsize=(figsize_width, figsize_height), dpi=target_dpi)
-
+    # Figure setup
+    dpi = 150
+    fig, ax = plt.subplots(figsize=(img_w / dpi, img_h / dpi), dpi=dpi)
     ax.imshow(img_array, origin="upper", zorder=0)
-    ax.set_xlim(0, img_width)
-    ax.set_ylim(img_height, 0)  # Invert y-axis to match image coordinates
+    ax.set_xlim(0, img_w)
+    ax.set_ylim(img_h, 0)
 
-    # -------------------------------------------------------
-    # MLB -> logical -> pixel coordinate transformation for spray points
-    #
-    # Uses a fixed 3-point affine transform so that a ball hit to RF
-    # always appears on the RF side of the image regardless of what
-    # other balls the player has in the dataset.
-    # (The old code used per-dataset min/max bounds which stretched a
-    # player's spray to fill the entire logical space, causing pull
-    # hitters to show all their balls in the wrong outfield zone.)
-    # -------------------------------------------------------
-    # MLB -> logical -> pixel coordinate transformation
-    # All tuning parameters live in SPRAY_CONFIG at the top of this file.
-    # -------------------------------------------------------
-    # MLB -> logical -> pixel coordinate transformation
-    #
-    # TUNABLE CONSTANTS — change these to move dots on the background image.
-    # Values are absolute pixel coordinates calibrated for background.avif.
-    #
-    #   OUTFIELD_TOP_PX / OUTFIELD_BOTTOM_PX
-    #     Vertical band where outfield dots are allowed.
-    #     Move dots UP  → decrease both values
-    #     Move dots DOWN → increase both values
-    #     Wider band     → increase BOTTOM or decrease TOP
-    #
-    #   HOME_X/Y_PX, LF/RF_POLE_X/Y_PX
-    #     Define the fair-territory wedge. Dots outside this are dropped.
-    # -------------------------------------------------------
-    OUTFIELD_TOP_PX    = 720    # ← fence / warning track row
-    OUTFIELD_BOTTOM_PX = 930   # ← infield edge row
-    HOME_X_PX    = 1170         # ← home plate X
-    HOME_Y_PX    = 1600         # ← home plate Y (bottom of 1560px image)
-    LF_POLE_X_PX =  248         # ← left foul pole X
-    LF_POLE_Y_PX =  848         # ← left foul pole Y
-    RF_POLE_X_PX = 2114         # ← right foul pole X
-    RF_POLE_Y_PX =  854         # ← right foul pole Y
-    # -------------------------------------------------------
-
-    # Fixed MLB field bounds in feet — NEVER use per-dataset min/max here.
-    # Using per-dataset bounds stretches a player's handful of RF balls
-    # across the full logical space, making everything land in the same pixel.
-    MLB_X_MIN, MLB_X_MAX = -350.0, 350.0   # left foul line to right foul line
-    MLB_Y_MIN, MLB_Y_MAX =  130.0, 380.0   # shallow to deep outfield
-
-    # Logical coordinate bounds (must match outfield_region_config.json)
-    LOGICAL_X_MIN, LOGICAL_X_MAX = -100.0, 100.0
-    LOGICAL_Y_MIN, LOGICAL_Y_MAX =   13.0, 50.0
-
+    # Map each ball to pixel coordinates via direction + distance
     balls_pixel = []
+    for idx, row in df.iterrows():
+        if pd.isna(row["x"]) or pd.isna(row["y"]):
+            continue
+        dir_val, dist_val = row.get("direction"), row.get("distance")
+        if dir_val is None or dist_val is None or pd.isna(dir_val) or pd.isna(dist_val):
+            continue
 
-    if len(df) > 0:
-        for idx, row in df.iterrows():
-            
-            mlb_x = row["x"]
-            mlb_y = row["y"]
+        depth_frac = np.clip(
+            (float(dist_val) - cfg["dist_min"]) / (cfg["dist_max"] - cfg["dist_min"]),
+            0.0, 1.0)
+        pixel_y = int(cfg["outfield_bottom_px"]
+                      - depth_frac * (cfg["outfield_bottom_px"] - cfg["outfield_top_px"]))
 
-            if pd.isna(mlb_x) or pd.isna(mlb_y):
-                continue
+        dir_frac = np.clip(
+            (float(dir_val) - cfg["dir_min"]) / (cfg["dir_max"] - cfg["dir_min"]),
+            0.0, 1.0)
 
-            # ---------------------------------------------------------
-            # Map direction + distance directly to curved pixel coords.
-            # This follows the perspective arc of the outfield in the photo.
-            # ---------------------------------------------------------
-            dir_val = row.get("direction")
-            dist_val = row.get("distance")
+        x_left = (cfg["home_x_px"]
+                  + (pixel_y - cfg["home_y_px"])
+                  * (cfg["lf_pole_x_px"] - cfg["home_x_px"])
+                  / (cfg["lf_pole_y_px"] - cfg["home_y_px"]))
+        x_right = (cfg["home_x_px"]
+                   + (pixel_y - cfg["home_y_px"])
+                   * (cfg["rf_pole_x_px"] - cfg["home_x_px"])
+                   / (cfg["rf_pole_y_px"] - cfg["home_y_px"]))
 
-            if dir_val is None or dist_val is None or pd.isna(dir_val) or pd.isna(dist_val):
-                continue
+        pixel_x = int(x_left + dir_frac * (x_right - x_left))
+        pixel_x = max(0, min(img_w - 1, pixel_x))
+        pixel_y = max(0, min(img_h - 1, pixel_y))
 
-            dir_f = float(dir_val)
-            dist_f = float(dist_val)
+        if pixel_y < cfg["outfield_top_px"] or pixel_y > cfg["outfield_bottom_px"]:
+            continue
 
-            # Depth fraction: 0 = shallow (infield edge), 1 = deep (fence)
-            DIST_MIN, DIST_MAX = 150.0, 400.0
-            depth_frac = (dist_f - DIST_MIN) / (DIST_MAX - DIST_MIN)
-            depth_frac = max(0.0, min(1.0, depth_frac))
+        color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
+        balls_pixel.append((pixel_x, pixel_y, color))
 
-            # Vertical pixel: deeper hits → closer to fence (smaller pixel_y)
-            pixel_y = int(OUTFIELD_BOTTOM_PX - depth_frac * (OUTFIELD_BOTTOM_PX - OUTFIELD_TOP_PX))
-
-            # Direction fraction: -45° (LF) to +45° (RF) → 0.0 to 1.0
-            DIR_MIN, DIR_MAX = -38.0, 38.0
-            dir_frac = (dir_f - DIR_MIN) / (DIR_MAX - DIR_MIN)
-            dir_frac = max(0.0, min(1.0, dir_frac))
-
-            # Horizontal pixel: follows the foul-line wedge at this depth.
-            # The wedge naturally narrows toward the fence → curved spray.
-            x_left  = HOME_X_PX + (pixel_y - HOME_Y_PX) * (LF_POLE_X_PX - HOME_X_PX) / (LF_POLE_Y_PX - HOME_Y_PX)
-            x_right = HOME_X_PX + (pixel_y - HOME_Y_PX) * (RF_POLE_X_PX - HOME_X_PX) / (RF_POLE_Y_PX - HOME_Y_PX)
-
-            pixel_x = int(x_left + dir_frac * (x_right - x_left))
-
-            # Clamp to image bounds
-            pixel_x = max(0, min(img_width  - 1, pixel_x))
-            pixel_y = max(0, min(img_height - 1, pixel_y))
-
-            # Depth filter: keep only the outfield grass band
-            if pixel_y < OUTFIELD_TOP_PX or pixel_y > OUTFIELD_BOTTOM_PX:
-                continue
-
-           
-
-            color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
-            balls_pixel.append((pixel_x, pixel_y, color))
-
-    # -------------------------------------------------------
-    # Calculate optimized fielder positions from spray dot locations
-    # Place each fielder at the centroid of spray dots in their zone
-    # -------------------------------------------------------
+    # Compute fielder centroids from spray zones
     optimized_pixel = {}
-
     if balls_pixel:
-        # Sort dots by pixel x to divide into LF/CF/RF thirds
         sorted_dots = sorted(balls_pixel, key=lambda d: d[0])
-        n_dots = len(sorted_dots)
-        third = max(1, n_dots // 3)
-
-        lf_dots = sorted_dots[:third]
-        cf_dots = sorted_dots[third:2*third]
-        rf_dots = sorted_dots[2*third:]
-
-        for name, dots in [("LF", lf_dots), ("CF", cf_dots), ("RF", rf_dots)]:
+        third = max(1, len(sorted_dots) // 3)
+        for name, dots in [("LF", sorted_dots[:third]),
+                           ("CF", sorted_dots[third:2*third]),
+                           ("RF", sorted_dots[2*third:])]:
             if dots:
-                avg_x = sum(d[0] for d in dots) / len(dots)
-                avg_y = sum(d[1] for d in dots) / len(dots)
-                optimized_pixel[name] = (avg_x, avg_y)
+                optimized_pixel[name] = (
+                    sum(d[0] for d in dots) / len(dots),
+                    sum(d[1] for d in dots) / len(dots),
+                )
 
-    # -------------------------------------------------------
-    # Reassign outcomes based on pixel-space distance to nearest fielder
-    # Outs cluster around fielders, hits land in gaps
-    # -------------------------------------------------------
+    # Reassign outcome colours by proximity to fielders
     if balls_pixel and optimized_pixel:
-        fielder_positions = list(optimized_pixel.values())
-        min_dists = []
-
-        for (px, py, _) in balls_pixel:
-            d = min(np.hypot(px - fx, py - fy) for fx, fy in fielder_positions)
-            min_dists.append(d)
-
-        min_dists = np.array(min_dists)
+        fp = list(optimized_pixel.values())
+        min_dists = np.array([
+            min(np.hypot(px - fx, py - fy) for fx, fy in fp)
+            for px, py, _ in balls_pixel
+        ])
         p65 = np.percentile(min_dists, 65)
         p90 = np.percentile(min_dists, 90)
+        oc = {"OUT": OUTCOME_COLORS["OUT"],
+              "SINGLE": OUTCOME_COLORS["SINGLE"],
+              "DOUBLE": OUTCOME_COLORS["DOUBLE"]}
+        balls_pixel = [
+            (px, py,
+             oc["OUT"] if min_dists[i] <= p65
+             else oc["SINGLE"] if min_dists[i] <= p90
+             else oc["DOUBLE"])
+            for i, (px, py, _) in enumerate(balls_pixel)
+        ]
 
-        outcome_colors = {
-            "OUT": "#bdbdbd",
-            "SINGLE": "#42a5f5",
-            "DOUBLE": "#e040fb",
-        }
-
-        new_balls = []
-        for i, (px, py, _) in enumerate(balls_pixel):
-            if min_dists[i] <= p65:
-                outcome = "OUT"
-            elif min_dists[i] <= p90:
-                outcome = "SINGLE"
-            else:
-                outcome = "DOUBLE"
-            new_balls.append((px, py, outcome_colors[outcome]))
-
-        balls_pixel = new_balls
-
-    # Draw spray dots (after outcome reassignment)
+    # Draw spray dots
     for px, py, color in balls_pixel:
-        ax.scatter(
-            px, py, s=40, c=color, alpha=0.7,
-            edgecolor="white", linewidth=0.5, zorder=5,
-        )
+        ax.scatter(px, py, s=40, c=color, alpha=0.7,
+                   edgecolor="white", linewidth=0.5, zorder=5)
 
-    # -------------------------------------------------------
-    # Draw optimized LF/CF/RF pixel markers
-    # -------------------------------------------------------
-    box_w, box_h = 8, 8
+    # Draw fielder markers
+    bw = 8
     for name, (px, py) in optimized_pixel.items():
-        rect = Rectangle(
-            (px - box_w / 2, py - box_h / 2),
-            box_w,
-            box_h,
-            linewidth=2,
-            edgecolor="red",
-            facecolor="yellow",
-            alpha=0.7,
-            zorder=7,
-        )
-        ax.add_patch(rect)
+        ax.add_patch(Rectangle((px - bw/2, py - bw/2), bw, bw,
+                               linewidth=2, edgecolor="red",
+                               facecolor="yellow", alpha=0.7, zorder=7))
+        ax.scatter(px, py, c="red", s=60, edgecolor="white",
+                   linewidth=0.8, zorder=8)
 
-        ax.scatter(
-            px,
-            py,
-            c="red",
-            s=60,
-            edgecolor="white",
-            linewidth=0.8,
-            zorder=8,
-        )
+    # Legend
+    ax.legend(handles=[
+        Patch(facecolor=OUTCOME_COLORS["OUT"], label="OUT"),
+        Patch(facecolor=OUTCOME_COLORS["SINGLE"], label="SINGLE"),
+        Patch(facecolor=OUTCOME_COLORS["DOUBLE"], label="DOUBLE"),
+    ], loc="upper right", framealpha=0.9, fontsize=10)
 
-    # -------------------------------------------------------
-    # Legend (OUT, SINGLE, DOUBLE)
-    # -------------------------------------------------------
-    from matplotlib.patches import Patch
-
-    legend_elements = [
-        Patch(facecolor=color_map["OUT"], label="OUT"),
-        Patch(facecolor=color_map["SINGLE"], label="SINGLE"),
-        Patch(facecolor=color_map["DOUBLE"], label="DOUBLE"),
-    ]
-
-    ax.legend(
-        handles=legend_elements,
-        loc="upper right",
-        framealpha=0.9,
-        fontsize=10,
-    )
-
-    # -------------------------------------------------------
-    # Final cleanup
-    # -------------------------------------------------------
     ax.axis("off")
-    ax.set_title(
-        f"{batter_label} vs {pitcher_hand}",
-        color="black",
-        fontsize=16,
-        pad=12,
-        weight="bold",
-    )
+    ax.set_title(f"{batter_label} vs {pitcher_hand}",
+                 color="black", fontsize=16, pad=12, weight="bold")
     ax.set_xticks([])
     ax.set_yticks([])
 
-    # Export the figure
     buf = io.BytesIO()
-    plt.savefig(
-        buf,
-        format="png",
-        dpi=target_dpi,
-        facecolor="white",
-        edgecolor="none",
-        bbox_inches=None,
-        pad_inches=0,
-    )
+    plt.savefig(buf, format="png", dpi=dpi, facecolor="white",
+                edgecolor="none", bbox_inches=None, pad_inches=0)
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# -------------------------------------------------------
-# DATA LOADER (development/testing mode using JSON files)
-#--------------------------------------------------------
-# Notes:
-# - JSON loader is used during development when API is unavailable.
-#
-# Environment override:
-#   USE_API_MODE=true  → force API mode (ignore JSON loader)
-#   USE_API_MODE=false → use JSON loader if available (default)
-# -------------------------------------------------------
 
-USE_API_MODE_ENV = os.getenv("USE_API_MODE", "false")
-USE_API_MODE = USE_API_MODE_ENV.lower() == "true"
+# ═════════════════════════════════════════════════════════
+#  DATA LOADING — unified per-pitcher-hand helper
+# ═════════════════════════════════════════════════════════
 
-log.info("=" * 60)
-log.info("Data Loading Mode")
-log.info(f"USE_API_MODE (from .env): '{USE_API_MODE_ENV}'")
-log.info(f"Mode interpreted as: {'API mode' if USE_API_MODE else 'JSON mode (default)'}")
-
-if USE_API_MODE:
-    # Force API mode via environment variable
-    USE_JSON_LOADER = False
-    log.info("API mode forced by environment variable (JSON loader disabled)")
-else:
-    # Default behavior:
-    # If data_loader.py exists → JSON loader mode
-    # If not, fall back to API adapter
-    try:
-        from data_loader import (
-            load_players,
-            get_player_spray_dataframe,
-            get_unique_players_with_spray_data,
-            filter_players_by_handedness,
-            parse_spray_to_dataframe
-        )
-        USE_JSON_LOADER = True
-        log.info("JSON loader mode enabled (data_loader.py detected)")
-    except ImportError:
-        USE_JSON_LOADER = False
-        log.warning("data_loader.py not found, falling back to API adapter")
-
-# -------------------------------------------------------
-# SLUGGER API ADAPTER LOADING
-# -------------------------------------------------------
-# If JSON loader is not used, attempt to load API adapter
-# -------------------------------------------------------
-try:
-    from adapter import (
-        fetch_ballparks,
-        fetch_games,
-        fetch_player_spray,
-        fetch_players,
-        MIN_QUALIFYING_BALLS
-    )
-    USE_API_ADAPTER = True
-    log.info("API adapter loaded successfully")
-except ImportError:
-    USE_API_ADAPTER = False
-    MIN_QUALIFYING_BALLS = 15  # fallback default
-    log.warning("adapter.py not found — API requests disabled")
-
-# -------------------------------------------------------
-# Determine final data mode
-# -------------------------------------------------------
-if USE_API_ADAPTER and not USE_JSON_LOADER:
-    final_mode = "API Adapter (SLUGGER API calls)"
-elif USE_JSON_LOADER:
-    final_mode = "JSON Loader (local spray data)"
-else:
-    final_mode = "Synthetic Data Mode (no API/JSON available)"
-
-log.info(f"Final Mode Selected: {final_mode}")
-log.info(f"Minimum qualifying outfield balls: {MIN_QUALIFYING_BALLS}")
-log.info("=" * 60)
-
-# -------------------------------------------------------
-# OPTIMIZER (Excel-based optimization algorithm)
-# -------------------------------------------------------
-try:
-    from optimizer import optimize_outfield_excel
-    USE_EXCEL_ALGORITHM = True
-    log.info("Excel-based optimizer loaded")
-except ImportError:
-    USE_EXCEL_ALGORITHM = False
-    log.warning("optimizer.py not found — falling back to basic brute-force optimizer")
-
-# -------------------------------------------------------
-# ROUTES
-# -------------------------------------------------------
-
-@app.route("/")
-def index():
+def load_spray_and_render(
+    batter_id: str,
+    pitcher_hand_label: str,
+    client_batter_name: Optional[str] = None,
+    client_batter_hand: Optional[str] = None,
+    background_image_path: str = DEFAULT_BACKGROUND,
+) -> Tuple[Optional[str], str]:
     """
-    Main page route — renders templates/index.html.
-    Player lists are loaded dynamically depending on mode:
-    - JSON loader mode (development)
-    - API adapter mode (production/test mode)
-    - Synthetic fallback if neither is available
-    """
-    # ---------------------------------------------------
-    # JSON LOADER MODE (local spray files available)
-    # ---------------------------------------------------
-    if USE_JSON_LOADER:
-        try:
-            players_with_data = get_unique_players_with_spray_data()
-
-            actual_batters = {}
-            seen_names = set()  # Deduplicate by (name, handedness)
-
-            for player in players_with_data:
-                player_id = player.get("player_id")
-                player_name = player.get("player_name", "Unknown")
-                batting_hand = (player.get("player_batting_handedness") or "").upper()
-
-                # Normalize handedness to a single letter
-                if batting_hand in ["LEFT", "L"]:
-                    hand_suffix = "L"
-                elif batting_hand in ["RIGHT", "R"]:
-                    hand_suffix = "R"
-                else:
-                    hand_suffix = "U"
-
-                # Clean and validate name text
-                name_clean = player_name.strip()
-                if not name_clean or len(name_clean) < 2:
-                    continue
-                if name_clean.startswith(",") or name_clean == ",":
-                    continue
-                if not re.search(r"[a-zA-Z0-9]", name_clean):
-                    continue
-
-                # Deduplicate identical name-hand combinations
-                key_pair = (name_clean, hand_suffix)
-                if key_pair in seen_names:
-                    continue
-                seen_names.add(key_pair)
-
-                key = f"{player_id}"
-                actual_batters[key] = {
-                    "label": f"{name_clean} ({hand_suffix})",
-                    "batter_name": name_clean,
-                    "batter_hand": hand_suffix,
-                    "player_id": player_id,
-                }
-
-            if actual_batters:
-                log.info(f"Loaded {len(actual_batters)} players from JSON loader")
-                return render_template("index.html", batters=actual_batters)
-            else:
-                log.warning("No players found via JSON loader, falling back to defaults")
-                return render_template("index.html", batters=BATTERS)
-
-        except Exception:
-            log.exception("Failed to load player list via JSON loader")
-            return render_template("index.html", batters=BATTERS)
-
-    # ---------------------------------------------------
-    # API ADAPTER MODE  
-    # ---------------------------------------------------
-    elif USE_API_ADAPTER:
-        try:
-            log.info("API mode enabled — fetching players via SLUGGER API")
-            players = fetch_players(limit=1000)
-            log.info(f"Received {len(players)} players from API")
-
-            actual_batters = {}
-            skipped_count = 0
-            duplicate_count = 0
-            seen_names = set()
-
-            for player in players:
-                player_id = player.get("player_id")
-                player_name = player.get("player_name") or "Unknown"
-                batting_hand_raw = player.get("player_batting_handedness") or ""
-                batting_hand = batting_hand_raw.upper()
-
-                if not player_id:
-                    skipped_count += 1
-                    continue
-
-                name_clean = player_name.strip()
-                if not name_clean or len(name_clean) < 2:
-                    skipped_count += 1
-                    continue
-                if name_clean.startswith(","):
-                    skipped_count += 1
-                    continue
-                if not re.search(r"[a-zA-Z0-9]", name_clean):
-                    skipped_count += 1
-                    continue
-
-                # Convert handedness to "L", "R", or "U"
-                if batting_hand in ["LEFT", "L"]:
-                    hand_suffix = "L"
-                elif batting_hand in ["RIGHT", "R"]:
-                    hand_suffix = "R"
-                else:
-                    hand_suffix = "U"
-
-                key_pair = (name_clean, hand_suffix)
-                if key_pair in seen_names:
-                    duplicate_count += 1
-                    continue
-                seen_names.add(key_pair)
-
-                key = f"{player_id}"
-                actual_batters[key] = {
-                    "label": f"{name_clean} ({hand_suffix})",
-                    "batter_name": name_clean,
-                    "batter_hand": hand_suffix,
-                    "player_id": player_id,
-                }
-
-            if skipped_count > 0:
-                log.warning(f"{skipped_count} players skipped due to invalid data")
-            if duplicate_count > 0:
-                log.info(f"{duplicate_count} duplicate players removed")
-
-            if actual_batters:
-                log.info(f"Loaded {len(actual_batters)} players from API")
-                # Kick off background probe if cache not yet ready
-                if not _cache_ready and not _players_with_data_cache:
-                    _start_background_probe(players)
-                return render_template("index.html", batters=actual_batters)
-            else:
-                log.warning("API returned players, but all were invalid or removed")
-                return render_template("index.html", batters=BATTERS)
-
-        except Exception:
-            log.exception("Failed to load player list via API")
-            return render_template("index.html", batters=BATTERS)
-
-    # ---------------------------------------------------
-    # SYNTHETIC FALLBACK MODE
-    # ---------------------------------------------------
-    else:
-        return render_template("index.html", batters=BATTERS)
-
-
-# -------------------------------------------------------
-# Background Player Probe Cache
-# Asynchronously checks which players have qualifying outfield data,
-# so the frontend can progressively filter the player dropdown.
-# -------------------------------------------------------
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-_players_with_data_cache: dict = {}   # player_id -> bool
-_cache_ready: bool = False
-
-
-def _probe_one_player(player_id: str) -> bool:
-    """Probe a single player — wraps the adapter function."""
-    try:
-        from adapter import probe_player_has_data
-        return probe_player_has_data(player_id)
-    except Exception:
-        return True  # Assume has data on error — don't hide them
-
-
-def _start_background_probe(players: list) -> None:
-    """
-    Spawn a background thread that probes each player for outfield data.
-
-    Respects the SLUGGER API rate limit of 100 req/min:
-      - 2 concurrent workers
-      - 1.2 second stagger per request
-      → ~1.67 req/sec = ~100 req/min with comfortable headroom
-
-    Results are written to _players_with_data_cache as they arrive.
-    _cache_ready is set to True when all probes complete.
-    """
-    players_to_probe = players[:500]
-
-    def run():
-        global _players_with_data_cache, _cache_ready
-
-        def probe(player):
-            pid = player.get("player_id")
-            if not pid:
-                return pid, False
-            import time
-            # Rate limit: 100 req/min API cap → stagger to stay safe
-            time.sleep(1.2)
-            return pid, _probe_one_player(pid)
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {executor.submit(probe, p): p for p in players_to_probe}
-            for future in as_completed(futures):
-                pid, result = future.result()
-                if pid:
-                    _players_with_data_cache[pid] = result
-
-        _cache_ready = True
-        found = sum(1 for v in _players_with_data_cache.values() if v)
-        log.info(
-            f"Background probe complete: {found}/{len(players_to_probe)} "
-            f"players confirmed with >= {MIN_QUALIFYING_BALLS} outfield balls"
-        )
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    log.info(f"Background probe started for {len(players_to_probe)} players")
-
-
-@app.route("/api/cache-status")
-def api_cache_status():
-    """
-    Returns the current background probe status.
-
-    The frontend polls this endpoint every few seconds after page load.
-    Once ready=True, it replaces the full player dropdown with only
-    players confirmed to have outfield data.
-
-    Response:
-        {
-          "ready": bool,
-          "batters": { player_id: {label, batter_name, batter_hand} },
-          "probed": int,   # how many players probed so far
-          "total": int     # total players in the API
-        }
-    """
-    try:
-        players = fetch_players(limit=1000)
-    except Exception:
-        return jsonify({"ready": False, "batters": {}, "probed": 0, "total": 0})
-
-    batters = {}
-    seen_names: set = set()
-
-    for player in players:
-        player_id = player.get("player_id")
-        if not player_id:
-            continue
-
-        # Only include players confirmed by the probe
-        if not _players_with_data_cache.get(player_id, False):
-            continue
-
-        player_name = (player.get("player_name") or "").strip()
-        if not player_name or len(player_name) < 2:
-            continue
-
-        batting_hand = (player.get("player_batting_handedness") or "").upper()
-        if batting_hand in ("LEFT", "L"):
-            hand = "L"
-        elif batting_hand in ("RIGHT", "R"):
-            hand = "R"
-        else:
-            hand = "U"
-
-        key_pair = (player_name, hand)
-        if key_pair in seen_names:
-            continue
-        seen_names.add(key_pair)
-
-        batters[player_id] = {
-            "label": f"{player_name} ({hand})",
-            "batter_name": player_name,
-            "batter_hand": hand,
-        }
-
-    return jsonify({
-        "ready": _cache_ready,
-        "batters": batters,
-        "probed": len(_players_with_data_cache),
-        "total": len(players)
-    })
-
-@app.route("/api/compute", methods=["POST"])
-def api_compute():
-    """
-    Core API endpoint for:
-        - Loading spray data (API, JSON loader, or synthetic fallback)
-        - Running outfield optimization
-        - Rendering spray chart image (drawn field or background image)
-        - Returning optimized fielder coordinates
-
-    This is the main engine used by the frontend.
-    """
-    try:
-        payload = request.get_json(force=True)
-
-        batter_id = payload.get("batter_id")
-        pitcher_hand = payload.get("pitcher_hand", "RHP")
-        background_image_path = payload.get("background_image_path", "img/background.png")
-
-        # Optional extra metadata sent from frontend
-        client_batter_name = payload.get("batter_name")
-        client_batter_hand = payload.get("batter_hand")
-
-        log.info(
-            f"Client-provided batter info: "
-            f"name='{client_batter_name}', hand='{client_batter_hand}'"
-        )
-
-        # ---------------------------------------------------
-        # MODE 1: API ADAPTER MODE - Production
-        # ---------------------------------------------------
-        if USE_API_ADAPTER and not USE_JSON_LOADER:
-
-            pitcher_hand_for_api = (
-                pitcher_hand.replace("HP", "").upper() if pitcher_hand else "R"
-            )  # e.g., "RHP" → "R"
-
-            # Step 1 — Pull spray data from the SLUGGER API
-            spray_data = fetch_player_spray(
-                player_id=batter_id,
-                pitcher_hand=pitcher_hand_for_api,
-                start_date=None,
-                end_date=None,
-                limit=1000,
-            )
-
-            if not spray_data:
-                log.warning(f"No spray data found for player {batter_id}")
-                return jsonify({
-                    "ok": False,
-                    "error": "No spray data available for this player."
-                }), 404
-
-            # Step 2 -- Convert JSON -> DataFrame
-            from data_loader import parse_spray_to_dataframe
-            df = parse_spray_to_dataframe(spray_data)
-
-            log.info(
-                f"parse_spray_to_dataframe: {len(df)} qualifying outfield rows "
-                f"for player {batter_id}"
-            )
-
-            # ---------------------------------------------------
-            # No qualifying outfield data -> return a proper error.
-            # Do NOT fall back to synthetic — misleading to the user.
-            # ---------------------------------------------------
-            if df.empty:
-                log.warning(f"No qualifying outfield data for player {batter_id}")
-                return jsonify({
-                    "ok": False,
-                    "error": (
-                        "No qualifying outfield balls found for this player. "
-                        "They may not have enough batted-ball data in the system."
-                    )
-                }), 404
-
-            df_filtered = df.dropna(subset=["x", "y"])
-
-            if len(df_filtered) < MIN_QUALIFYING_BALLS:
-                log.warning(
-                    f"Only {len(df_filtered)} valid coordinate rows for {batter_id} "
-                    f"(minimum {MIN_QUALIFYING_BALLS} required)"
-                )
-                return jsonify({
-                    "ok": False,
-                    "error": (
-                        f"Only {len(df_filtered)} outfield balls with valid coordinates "
-                        f"(minimum {MIN_QUALIFYING_BALLS} required). "
-                        f"Try selecting a player with more plate appearances."
-                    )
-                }), 404
-
-            # ---------------------------------------------------
-            # Valid real API data -- normal processing
-            # ---------------------------------------------------
-            df_filtered = df_filtered.copy()
-            df_filtered["hang_time"] = df_filtered["hang_time"].fillna(3.0)
-            df_filtered["outcome"] = df_filtered["outcome"].fillna("OUT")
-            df = df_filtered
-
-            # Resolve batter metadata: client payload first, then API lookup
-            if client_batter_name and client_batter_name.strip():
-                name = client_batter_name.strip()
-                raw_hand = client_batter_hand or "R"
-            else:
-                try:
-                    players = fetch_players(limit=5000)
-                    match = next(
-                        (p for p in players if p.get("player_id") == batter_id),
-                        None
-                    )
-                    if match:
-                        name = match.get("player_name") or f"Player {batter_id[:8]}"
-                        raw_hand = match.get("player_batting_handedness") or "R"
-                    else:
-                        name = f"Player {batter_id[:8]}"
-                        raw_hand = "R"
-                except Exception:
-                    name = f"Player {batter_id[:8]}"
-                    raw_hand = "R"
-
-            if str(raw_hand).upper() in ("LEFT", "L"):
-                bh = "L"
-            elif str(raw_hand).upper() in ("RIGHT", "R"):
-                bh = "R"
-            else:
-                bh = "U"
-
-            meta = {
-                "label": f"{name} ({bh})",
-                "batter_name": name,
-                "batter_hand": bh,
-                "player_id": batter_id
-            }
-
-            positions_drawn = None  # handled inside make_plot_with_image()
-
-        # ---------------------------------------------------
-        # MODE 2: JSON LOADER MODE
-        # ---------------------------------------------------
-        elif USE_JSON_LOADER:
-
-            players_with_data = get_unique_players_with_spray_data()
-            player_ids = {p.get("player_id") for p in players_with_data}
-
-            if batter_id in player_ids:
-                selected = next(
-                    p for p in players_with_data if p.get("player_id") == batter_id
-                )
-
-                name = selected.get("player_name", "Unknown")
-                raw_hand = (selected.get("player_batting_handedness") or "").upper()
-
-                if raw_hand in ["LEFT", "L"]:
-                    bh = "L"
-                elif raw_hand in ["RIGHT", "R"]:
-                    bh = "R"
-                else:
-                    bh = "U"
-
-                meta = {
-                    "label": f"{name} ({bh})",
-                    "batter_name": name,
-                    "batter_hand": bh,
-                    "player_id": batter_id
-                }
-
-                df = get_player_spray_dataframe(batter_id)
-
-                if df.empty or df.dropna(subset=["x", "y"]).shape[0] < MIN_QUALIFYING_BALLS:
-                    df_drawn = generate_spray("dickerson_R", pitcher_hand)
-                    df = df_drawn.copy()
-                    df["x"] = (df_drawn["x"] - 150) * 0.5
-                    df["y"] = (df_drawn["y"] - 200) * 2.0
-                    df["hang_time"] = 3.0
-                    positions_drawn = optimize_outfield(df_drawn)
-                    df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-                    df["outcome"] = df_drawn["outcome"].values[:len(df)]
-                else:
-                    df = df.dropna(subset=["x", "y"])
-                    df["hang_time"] = df["hang_time"].fillna(3.0)
-                    df["outcome"] = df["outcome"].fillna("OUT")
-                    positions_drawn = None
-
-            else:
-                # Legacy fallback if batter_id not found
-                if batter_id not in BATTERS:
-                    return jsonify({"ok": False, "error": "Unknown batter"}), 400
-
-                meta = BATTERS[batter_id]
-
-                df_drawn = generate_spray(batter_id, pitcher_hand)
-                df = df_drawn.copy()
-                df["x"] = (df_drawn["x"] - 150) * 0.5
-                df["y"] = (df_drawn["y"] - 200) * 2.0
-                df["hang_time"] = 3.0
-                positions_drawn = optimize_outfield(df_drawn)
-                df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-                df["outcome"] = df_drawn["outcome"].values[:len(df)]
-
-        # ---------------------------------------------------
-        # MODE 3: Neither JSON loader nor API adapter available
-        # ---------------------------------------------------
-        else:
-            if batter_id not in BATTERS:
-                return jsonify({"ok": False, "error": "Unknown batter"}), 400
-
-            meta = BATTERS[batter_id]
-
-            df_drawn = generate_spray(batter_id, pitcher_hand)
-            df = df_drawn.copy()
-            df["x"] = (df_drawn["x"] - 150) * 0.5
-            df["y"] = (df_drawn["y"] - 200) * 2.0
-            df["hang_time"] = 3.0
-            positions_drawn = optimize_outfield(df_drawn)
-            df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-            df["outcome"] = df_drawn["outcome"].values[:len(df)]
-
-        # ---------------------------------------------------
-        # Save optimized CSV 
-        # ---------------------------------------------------
-        if positions_drawn:
-            pd.DataFrame.from_dict(
-                positions_drawn, orient="index", columns=["X", "Y"]
-            ).to_csv(LAST_CSV_PATH)
-
-        # ---------------------------------------------------
-        # Create visualization (drawn or background image)
-        # Passing positions=None triggers internal optimization
-        # ---------------------------------------------------
-        img_b64 = make_plot_with_image(
-            df,
-            positions=None,
-            batter_label=meta["label"],
-            pitcher_hand=pitcher_hand,
-            background_image_path=background_image_path
-        )
-        
-        return jsonify({
-            "ok": True,
-            "batter_id": batter_id,
-            "batter_label": meta["label"],
-            "batter_hand": meta["batter_hand"],
-            "pitcher_hand": pitcher_hand,
-            "positions": positions_drawn if positions_drawn else {},
-            "image_base64": img_b64,
-            "download_url": "/download"
-        })
-
-    except Exception as e:
-        log.exception("api_compute failed")
-        return jsonify({"ok": False, "error": str(e)}), 500
-# -------------------------------------------------------
-# ROUTE: Download Last Optimization Result
-# -------------------------------------------------------
-
-@app.route("/download")
-def download():
-    """
-    Serves the last generated CSV containing optimized positions.
-    Used by the frontend for 'Download Positions' functionality.
-    """
-    if not pd.io.common.file_exists(LAST_CSV_PATH):
-        return "Run an optimization first.", 404
-
-    return send_file(LAST_CSV_PATH, as_attachment=True)
-
-
-# -------------------------------------------------------
-# SLUGGER API ENDPOINTS
-# -------------------------------------------------------
-# These endpoints expose API adapter functionality for use
-# by frontend tools or external utilities.
-# -------------------------------------------------------
-
-@app.route("/api/ballparks", methods=["GET"])
-def api_ballparks():
-    """
-    Retrieve ballpark information from SLUGGER API.
-
-    Query parameters:
-        ballpark_name
-        city
-        state
-        limit (default 50)
-        page (default 1)
-        order ("ASC" or "DESC")
+    Load spray data for one batter + pitcher hand and render a chart.
 
     Returns:
-        JSON: { success, data, count }
+        (base64_png, batter_label)  on success
+        (None, error_message)       on failure
     """
-
-    if not USE_API_ADAPTER:
-        return jsonify({
-            "success": False,
-            "error": "API adapter not available"
-        }), 503
-
-    try:
-        ballpark_name = request.args.get("ballpark_name")
-        city = request.args.get("city")
-        state = request.args.get("state")
-
-        limit = int(request.args.get("limit", 50))
-        page = int(request.args.get("page", 1))
-        order = request.args.get("order", "ASC")
-
-        ballparks = fetch_ballparks(
-            ballpark_name=ballpark_name,
-            city=city,
-            state=state,
-            limit=limit,
-            page=page,
-            order=order
-        )
-
-        return jsonify({
-            "success": True,
-            "data": ballparks,
-            "count": len(ballparks)
-        })
-
-    except Exception as e:
-        log.exception("api_ballparks failed")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-
-@app.route("/api/games", methods=["GET"])
-def api_games():
-    """
-    Retrieve game information from SLUGGER API.
-
-    Query parameters:
-        ballpark_name
-        team_name
-        start_date (YYYY-MM-DD)
-        end_date (YYYY-MM-DD)
-        limit (default 50)
-        page (default 1)
-        order ("ASC" or "DESC")
-
-    Returns:
-        JSON: { success, data, count }
-    """
-
-    if not USE_API_ADAPTER:
-        return jsonify({
-            "success": False,
-            "error": "API adapter not available"
-        }), 503
-
-    try:
-        ballpark_name = request.args.get("ballpark_name")
-        team_name = request.args.get("team_name")
-        start_date = request.args.get("start_date")
-        end_date = request.args.get("end_date")
-
-        limit = int(request.args.get("limit", 50))
-        page = int(request.args.get("page", 1))
-        order = request.args.get("order", "DESC")
-
-        games = fetch_games(
-            ballpark_name=ballpark_name,
-            team_name=team_name,
-            start_date=start_date,
-            end_date=end_date,
-            limit=limit,
-            page=page,
-            order=order
-        )
-
-        return jsonify({
-            "success": True,
-            "data": games,
-            "count": len(games)
-        })
-
-    except Exception as e:
-        log.exception("api_games failed")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-
-@app.route("/api/players/<player_id>/spray", methods=["GET"])
-def api_player_spray(player_id: str):
-    """
-    Retrieve spray data for a specific player using SLUGGER API.
-
-    Path parameter:
-        player_id
-
-    Query parameters:
-        pitcher_hand: "R" or "L"
-        start_date: YYYY-MM-DD
-        end_date: YYYY-MM-DD
-        limit: max number of rows (default 5000)
-
-    Returns:
-        JSON: { success, data, count }
-    """
-
-    if not USE_API_ADAPTER:
-        return jsonify({
-            "success": False,
-            "error": "API adapter not available"
-        }), 503
-
-    try:
-        pitcher_hand = request.args.get("pitcher_hand")
-        start_date = request.args.get("start_date")
-        end_date = request.args.get("end_date")
-        limit = int(request.args.get("limit", 5000))
-
-        spray_data = fetch_player_spray(
-            player_id=player_id,
-            pitcher_hand=pitcher_hand,
-            start_date=start_date,
-            end_date=end_date,
-            limit=limit
-        )
-
-        return jsonify({
-            "success": True,
-            "data": spray_data,
-            "count": len(spray_data)
-        })
-
-    except Exception as e:
-        log.exception("api_player_spray failed")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route("/api/optimize/<player_id>", methods=["GET", "POST"])
-def api_optimize_and_visualize(player_id: str):
-    """
-    Compute optimal outfield positioning for a given player and return:
-        - A rendered spray chart (base64 PNG)
-        - Optimized LF, CF, RF coordinates (pixel coordinates for display)
-        - Logical coordinates (Excel grid space for analysis)
-        - Count of valid data points used
-
-    This endpoint is API-only
-    """
-
-    if not USE_API_ADAPTER:
-        return jsonify({
-            "success": False,
-            "error": "API adapter not available"
-        }), 503
-
-    try:
-        # -------------------------------------------------------
-        # Parse request parameters (GET or POST)
-        # -------------------------------------------------------
-        if request.method == "POST":
-            payload = request.get_json(force=True) or {}
-            pitcher_hand = payload.get("pitcher_hand", "R")
-            start_date = payload.get("start_date")
-            end_date = payload.get("end_date")
-            background_image_path = payload.get("background_image_path", "img/background.png")
-        else:
-            pitcher_hand = request.args.get("pitcher_hand", "R")
-            start_date = request.args.get("start_date")
-            end_date = request.args.get("end_date")
-            background_image_path = request.args.get("background_image_path", "img/background.png")
-
-        # -------------------------------------------------------
-        # Step 1 — Fetch spray data from SLUGGER API
-        # -------------------------------------------------------
-        spray_data = fetch_player_spray(
-            player_id=player_id,
-            pitcher_hand=pitcher_hand,
-            start_date=start_date,
-            end_date=end_date,
-            limit=1000
-        )
-
-        if not spray_data:
-            return jsonify({
-                "success": False,
-                "error": f"No spray data found for player {player_id}"
-            }), 404
-
-        # -------------------------------------------------------
-        # Step 2 — Convert raw spray JSON → DataFrame
-        # -------------------------------------------------------
-        from data_loader import parse_spray_to_dataframe
-        df = parse_spray_to_dataframe(spray_data)
-
-        if df.empty:
-            return jsonify({
-                "success": False,
-                "error": "Failed to parse spray data"
-            }), 400
-
-        # Keep only rows with MLB coordinates AND hang-time
-        df_filtered = df.dropna(subset=["x", "y", "hang_time"])
-
-        if len(df_filtered) < MIN_QUALIFYING_BALLS:
-            return jsonify({
-                "success": False,
-                "error": (
-                    f"Insufficient valid spray data: {len(df_filtered)} rows "
-                    f"(minimum {MIN_QUALIFYING_BALLS} required)"
-                )
-            }), 400
-
-        # -------------------------------------------------------
-        # Step 3 — Convert MLB coordinates → Logical coordinates
-        # -------------------------------------------------------
-        from mlb_to_logical_converter import convert_dataframe_mlb_to_logical
-
-        df_logical = convert_dataframe_mlb_to_logical(
-            df_filtered,
-            mlb_x_col="x",
-            mlb_y_col="y"
-        )
-
-        # -------------------------------------------------------
-        # Step 4 — Run optimization in logical coordinate space
-        # -------------------------------------------------------
-        from optimizer import optimize_outfield_excel
-        positions_excel_grid = optimize_outfield_excel(df_logical)
-
-        # Convert optimizer grid output → logical coordinates
-        from excel_grid_to_logical_converter import convert_optimizer_positions_to_logical
-
-        positions_logical = convert_optimizer_positions_to_logical(positions_excel_grid)
-
-        # -------------------------------------------------------
-        # Step 5 — Render visualization (background or drawn field)
-        # -------------------------------------------------------
-        batter_label = f"Player {player_id[:8]}"
-
-        
-        img_b64 = make_plot_with_image(
-            df_filtered,
-            positions=positions_logical,
-            batter_label=batter_label,
-            pitcher_hand="RHP" if pitcher_hand.upper() == "R" else "LHP",
-            background_image_path=background_image_path
-        )
-
-        # -------------------------------------------------------
-        # Step 6 — Convert logical → pixel coordinates for display
-        # -------------------------------------------------------
-        from outfield_region import OutfieldRegionManager
-
-        outfield_manager = OutfieldRegionManager("outfield_region_config.json")
-
-        positions_pixel = {}
-        for name, (lx, ly) in positions_logical.items():
-            px, py = outfield_manager.logical_to_pixel((lx, ly))
-            positions_pixel[name] = (float(px), float(py))
-
-        # -------------------------------------------------------
-        # Step 7 — Return complete response
-        # -------------------------------------------------------
-        return jsonify({
-            "success": True,
-            "image_base64": img_b64,
-            "positions": positions_pixel,  # pixel coordinates for display
-            "positions_logical": {
-                k: (float(v[0]), float(v[1]))
-                for k, v in positions_logical.items()
-            },
-            "data_count": len(df_filtered),
-            "batter_label": batter_label,
-            "player_id": player_id,
-            "pitcher_hand": pitcher_hand
-        })
-
-    except Exception as e:
-        log.exception("api_optimize_and_visualize failed")
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-# -------------------------------------------------------
-# PDF DOWNLOAD ENDPOINT
-# -------------------------------------------------------
-# Generates a landscape 11×8.5 PDF with spray charts for
-# both pitcher hands (vs RHP and vs LHP) side by side.
-# -------------------------------------------------------
-
-def _load_spray_for_pitcher_hand(batter_id, pitcher_hand_label, client_batter_name=None, client_batter_hand=None):
-    """
-    Internal helper: loads spray data and generates a chart image (base64 PNG)
-    for a given batter + pitcher hand combination.
-
-    Reuses the same data-loading logic as /api/compute.
-
-    Returns:
-        (img_b64, batter_label) or (None, error_string)
-    """
-    background_image_path = "img/background.png"
-
-    # --- API ADAPTER MODE ---
+    # ── API adapter mode ──
     if USE_API_ADAPTER and not USE_JSON_LOADER:
-        pitcher_hand_for_api = pitcher_hand_label.replace("HP", "").upper()
-
+        pitcher_letter = pitcher_hand_label.replace("HP", "").upper()
         spray_data = fetch_player_spray(
-            player_id=batter_id,
-            pitcher_hand=pitcher_hand_for_api,
-            start_date=None,
-            end_date=None,
-            limit=1000,
-        )
+            player_id=batter_id, pitcher_hand=pitcher_letter,
+            start_date=None, end_date=None, limit=1000)
 
         if not spray_data:
             return None, f"No spray data for {pitcher_hand_label}"
 
         from data_loader import parse_spray_to_dataframe
         df = parse_spray_to_dataframe(spray_data)
-
         if df.empty:
             return None, f"No qualifying outfield data for {pitcher_hand_label}"
 
-        df_filtered = df.dropna(subset=["x", "y"])
+        df = df.dropna(subset=["x", "y"])
+        if len(df) < MIN_QUALIFYING_BALLS:
+            return None, (f"Only {len(df)} balls for {pitcher_hand_label} "
+                          f"(need {MIN_QUALIFYING_BALLS})")
 
-        if len(df_filtered) < MIN_QUALIFYING_BALLS:
-            return None, f"Only {len(df_filtered)} balls for {pitcher_hand_label} (need {MIN_QUALIFYING_BALLS})"
+        df = df.copy()
+        df["hang_time"] = df["hang_time"].fillna(3.0)
+        df["outcome"] = df["outcome"].fillna("OUT")
 
-        df_filtered = df_filtered.copy()
-        df_filtered["hang_time"] = df_filtered["hang_time"].fillna(3.0)
-        df_filtered["outcome"] = df_filtered["outcome"].fillna("OUT")
-        df = df_filtered
+        meta = resolve_batter_meta(batter_id, client_batter_name, client_batter_hand)
+        batter_label = meta["label"]
 
-        # Resolve batter name
-        if client_batter_name and client_batter_name.strip():
-            name = client_batter_name.strip()
-            raw_hand = client_batter_hand or "R"
-        else:
-            try:
-                players = fetch_players(limit=5000)
-                match = next(
-                    (p for p in players if p.get("player_id") == batter_id), None
-                )
-                if match:
-                    name = match.get("player_name") or f"Player {batter_id[:8]}"
-                    raw_hand = match.get("player_batting_handedness") or "R"
-                else:
-                    name = f"Player {batter_id[:8]}"
-                    raw_hand = "R"
-            except Exception:
-                name = f"Player {batter_id[:8]}"
-                raw_hand = "R"
-
-        if str(raw_hand).upper() in ("LEFT", "L"):
-            bh = "L"
-        elif str(raw_hand).upper() in ("RIGHT", "R"):
-            bh = "R"
-        else:
-            bh = "U"
-
-        batter_label = f"{name} ({bh})"
-
-    # --- JSON LOADER MODE ---
+    # ── JSON loader mode ──
     elif USE_JSON_LOADER:
         players_with_data = get_unique_players_with_spray_data()
         player_ids = {p.get("player_id") for p in players_with_data}
 
         if batter_id in player_ids:
-            selected = next(
-                p for p in players_with_data if p.get("player_id") == batter_id
-            )
+            selected = next(p for p in players_with_data
+                            if p.get("player_id") == batter_id)
             name = selected.get("player_name", "Unknown")
-            raw_hand = (selected.get("player_batting_handedness") or "").upper()
-            if raw_hand in ["LEFT", "L"]:
-                bh = "L"
-            elif raw_hand in ["RIGHT", "R"]:
-                bh = "R"
-            else:
-                bh = "U"
-            batter_label = f"{name} ({bh})"
-            df = get_player_spray_dataframe(batter_id)
+            hand = normalize_hand(selected.get("player_batting_handedness") or "")
+            batter_label = f"{name} ({hand})"
 
+            df = get_player_spray_dataframe(batter_id)
             if df.empty or df.dropna(subset=["x", "y"]).shape[0] < MIN_QUALIFYING_BALLS:
-                df_drawn = generate_spray("dickerson_R", pitcher_hand_label)
-                df = df_drawn.copy()
-                df["x"] = (df_drawn["x"] - 150) * 0.5
-                df["y"] = (df_drawn["y"] - 200) * 2.0
-                df["hang_time"] = 3.0
-                positions_drawn = optimize_outfield(df_drawn)
-                df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-                df["outcome"] = df_drawn["outcome"].values[:len(df)]
+                df, _ = _prepare_synthetic("dickerson_R", pitcher_hand_label)
             else:
                 df = df.dropna(subset=["x", "y"])
                 df["hang_time"] = df["hang_time"].fillna(3.0)
                 df["outcome"] = df["outcome"].fillna("OUT")
+
         elif batter_id in BATTERS:
-            meta = BATTERS[batter_id]
-            batter_label = meta["label"]
-            df_drawn = generate_spray(batter_id, pitcher_hand_label)
-            df = df_drawn.copy()
-            df["x"] = (df_drawn["x"] - 150) * 0.5
-            df["y"] = (df_drawn["y"] - 200) * 2.0
-            df["hang_time"] = 3.0
-            positions_drawn = optimize_outfield(df_drawn)
-            df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-            df["outcome"] = df_drawn["outcome"].values[:len(df)]
+            batter_label = BATTERS[batter_id]["label"]
+            df, _ = _prepare_synthetic(batter_id, pitcher_hand_label)
         else:
             return None, "Unknown batter"
 
-    # --- SYNTHETIC MODE ---
+    # ── Synthetic fallback ──
     else:
         if batter_id not in BATTERS:
             return None, "Unknown batter"
-        meta = BATTERS[batter_id]
-        batter_label = meta["label"]
-        df_drawn = generate_spray(batter_id, pitcher_hand_label)
-        df = df_drawn.copy()
-        df["x"] = (df_drawn["x"] - 150) * 0.5
-        df["y"] = (df_drawn["y"] - 200) * 2.0
-        df["hang_time"] = 3.0
-        positions_drawn = optimize_outfield(df_drawn)
-        df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
-        df["outcome"] = df_drawn["outcome"].values[:len(df)]
+        batter_label = BATTERS[batter_id]["label"]
+        df, _ = _prepare_synthetic(batter_id, pitcher_hand_label)
 
-    # Generate the chart
+    # Render chart
     img_b64 = make_plot_with_image(
-        df,
-        positions=None,
-        batter_label=batter_label,
+        df, positions=None, batter_label=batter_label,
         pitcher_hand=pitcher_hand_label,
-        background_image_path=background_image_path,
-    )
+        background_image_path=background_image_path)
 
     return img_b64, batter_label
 
 
+# ═════════════════════════════════════════════════════════
+#  BACKGROUND PLAYER PROBE CACHE
+# ═════════════════════════════════════════════════════════
+
+_players_with_data_cache: dict = {}
+_cache_ready: bool = False
+
+
+def _probe_one_player(player_id: str) -> bool:
+    try:
+        from adapter import probe_player_has_data
+        return probe_player_has_data(player_id)
+    except Exception:
+        return True
+
+
+def _start_background_probe(players: list) -> None:
+    """Probe players for qualifying data in a background thread."""
+    batch = players[:500]
+
+    def run():
+        global _players_with_data_cache, _cache_ready
+        import time
+
+        def probe(player):
+            pid = player.get("player_id")
+            if not pid:
+                return pid, False
+            time.sleep(1.2)
+            return pid, _probe_one_player(pid)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for future in as_completed(
+                {pool.submit(probe, p): p for p in batch}
+            ):
+                pid, result = future.result()
+                if pid:
+                    _players_with_data_cache[pid] = result
+
+        _cache_ready = True
+        found = sum(1 for v in _players_with_data_cache.values() if v)
+        log.info("Probe complete: %d/%d players confirmed", found, len(batch))
+
+    threading.Thread(target=run, daemon=True).start()
+    log.info("Background probe started for %d players", len(batch))
+
+
+# ═════════════════════════════════════════════════════════
+#  ROUTES
+# ═════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    """Render the main page with the player dropdown."""
+    if USE_JSON_LOADER:
+        try:
+            batters = build_player_dict(get_unique_players_with_spray_data())
+            if batters:
+                return render_template("index.html", batters=batters)
+        except Exception:
+            log.exception("JSON loader failed")
+
+    elif USE_API_ADAPTER:
+        try:
+            players = fetch_players(limit=1000)
+            batters = build_player_dict(players)
+            if batters:
+                if not _cache_ready and not _players_with_data_cache:
+                    _start_background_probe(players)
+                return render_template("index.html", batters=batters)
+        except Exception:
+            log.exception("API player fetch failed")
+
+    return render_template("index.html", batters=BATTERS)
+
+
+@app.route("/api/batters")
+def api_batters():
+    """Return the current batter list as JSON (used by React frontend)."""
+    if USE_JSON_LOADER:
+        try:
+            batters = build_player_dict(get_unique_players_with_spray_data())
+            if batters:
+                return jsonify({"ok": True, "batters": batters})
+        except Exception:
+            pass
+    elif USE_API_ADAPTER:
+        try:
+            batters = build_player_dict(fetch_players(limit=1000))
+            if batters:
+                return jsonify({"ok": True, "batters": batters})
+        except Exception:
+            pass
+    return jsonify({"ok": True, "batters": BATTERS})
+
+
+@app.route("/api/cache-status")
+def api_cache_status():
+    """Return background probe progress for the frontend to poll."""
+    try:
+        players = fetch_players(limit=1000)
+    except Exception:
+        return jsonify({"ready": False, "batters": {}, "probed": 0, "total": 0})
+
+    confirmed = [
+        p for p in players
+        if p.get("player_id") and _players_with_data_cache.get(p["player_id"], False)
+    ]
+    batters = build_player_dict(confirmed)
+
+    return jsonify({
+        "ready": _cache_ready,
+        "batters": batters,
+        "probed": len(_players_with_data_cache),
+        "total": len(players),
+    })
+
+
+@app.route("/api/compute", methods=["POST"])
+def api_compute():
+    """Main computation endpoint: load data → optimize → render chart."""
+    try:
+        payload = request.get_json(force=True)
+        batter_id = payload.get("batter_id")
+        pitcher_hand = payload.get("pitcher_hand", "RHP")
+        bg_path = payload.get("background_image_path", DEFAULT_BACKGROUND)
+        client_name = payload.get("batter_name")
+        client_hand = payload.get("batter_hand")
+
+        # ── API adapter mode ──
+        if USE_API_ADAPTER and not USE_JSON_LOADER:
+            pitcher_letter = pitcher_hand.replace("HP", "").upper() if pitcher_hand else "R"
+            spray_data = fetch_player_spray(
+                player_id=batter_id, pitcher_hand=pitcher_letter,
+                start_date=None, end_date=None, limit=1000)
+
+            if not spray_data:
+                return jsonify({"ok": False, "error": "No spray data available."}), 404
+
+            from data_loader import parse_spray_to_dataframe
+            df = parse_spray_to_dataframe(spray_data)
+            if df.empty:
+                return jsonify({"ok": False, "error": "No qualifying outfield balls found."}), 404
+
+            df = df.dropna(subset=["x", "y"])
+            if len(df) < MIN_QUALIFYING_BALLS:
+                return jsonify({
+                    "ok": False,
+                    "error": f"Only {len(df)} balls (need {MIN_QUALIFYING_BALLS})."
+                }), 404
+
+            df = df.copy()
+            df["hang_time"] = df["hang_time"].fillna(3.0)
+            df["outcome"] = df["outcome"].fillna("OUT")
+            meta = resolve_batter_meta(batter_id, client_name, client_hand)
+            positions_drawn = None
+
+        # ── JSON loader mode ──
+        elif USE_JSON_LOADER:
+            player_ids = {
+                p.get("player_id")
+                for p in get_unique_players_with_spray_data()
+            }
+
+            if batter_id in player_ids:
+                selected = next(p for p in get_unique_players_with_spray_data()
+                                if p.get("player_id") == batter_id)
+                name = selected.get("player_name", "Unknown")
+                hand = normalize_hand(selected.get("player_batting_handedness") or "")
+                meta = {"label": f"{name} ({hand})",
+                        "batter_name": name, "batter_hand": hand,
+                        "player_id": batter_id}
+
+                df = get_player_spray_dataframe(batter_id)
+                if df.empty or df.dropna(subset=["x", "y"]).shape[0] < MIN_QUALIFYING_BALLS:
+                    df, positions_drawn = _prepare_synthetic("dickerson_R", pitcher_hand)
+                else:
+                    df = df.dropna(subset=["x", "y"])
+                    df["hang_time"] = df["hang_time"].fillna(3.0)
+                    df["outcome"] = df["outcome"].fillna("OUT")
+                    positions_drawn = None
+
+            elif batter_id in BATTERS:
+                meta = BATTERS[batter_id]
+                df, positions_drawn = _prepare_synthetic(batter_id, pitcher_hand)
+            else:
+                return jsonify({"ok": False, "error": "Unknown batter"}), 400
+
+        # ── Synthetic fallback ──
+        else:
+            if batter_id not in BATTERS:
+                return jsonify({"ok": False, "error": "Unknown batter"}), 400
+            meta = BATTERS[batter_id]
+            df, positions_drawn = _prepare_synthetic(batter_id, pitcher_hand)
+
+        # Save CSV
+        if positions_drawn:
+            pd.DataFrame.from_dict(
+                positions_drawn, orient="index", columns=["X", "Y"]
+            ).to_csv(LAST_CSV_PATH)
+
+        # Render
+        img_b64 = make_plot_with_image(
+            df, positions=None, batter_label=meta["label"],
+            pitcher_hand=pitcher_hand, background_image_path=bg_path)
+
+        return jsonify({
+            "ok": True,
+            "batter_id": batter_id,
+            "batter_label": meta["label"],
+            "batter_hand": meta["batter_hand"],
+            "pitcher_hand": pitcher_hand,
+            "positions": positions_drawn or {},
+            "image_base64": img_b64,
+            "download_url": "/download",
+        })
+
+    except Exception as e:
+        log.exception("api_compute failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/download")
+def download():
+    """Serve the last optimized-positions CSV."""
+    if not pd.io.common.file_exists(LAST_CSV_PATH):
+        return "Run an optimization first.", 404
+    return send_file(LAST_CSV_PATH, as_attachment=True)
+
+
+# ═════════════════════════════════════════════════════════
+#  SLUGGER API PASS-THROUGH ENDPOINTS
+# ═════════════════════════════════════════════════════════
+
+def _require_api_adapter():
+    if not USE_API_ADAPTER:
+        return jsonify({"success": False, "error": "API adapter not available"}), 503
+    return None
+
+
+@app.route("/api/ballparks", methods=["GET"])
+def api_ballparks():
+    err = _require_api_adapter()
+    if err:
+        return err
+    try:
+        data = fetch_ballparks(
+            ballpark_name=request.args.get("ballpark_name"),
+            city=request.args.get("city"),
+            state=request.args.get("state"),
+            limit=int(request.args.get("limit", 50)),
+            page=int(request.args.get("page", 1)),
+            order=request.args.get("order", "ASC"))
+        return jsonify({"success": True, "data": data, "count": len(data)})
+    except Exception as e:
+        log.exception("api_ballparks failed")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/games", methods=["GET"])
+def api_games():
+    err = _require_api_adapter()
+    if err:
+        return err
+    try:
+        data = fetch_games(
+            ballpark_name=request.args.get("ballpark_name"),
+            team_name=request.args.get("team_name"),
+            start_date=request.args.get("start_date"),
+            end_date=request.args.get("end_date"),
+            limit=int(request.args.get("limit", 50)),
+            page=int(request.args.get("page", 1)),
+            order=request.args.get("order", "DESC"))
+        return jsonify({"success": True, "data": data, "count": len(data)})
+    except Exception as e:
+        log.exception("api_games failed")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/players/<player_id>/spray", methods=["GET"])
+def api_player_spray(player_id: str):
+    err = _require_api_adapter()
+    if err:
+        return err
+    try:
+        data = fetch_player_spray(
+            player_id=player_id,
+            pitcher_hand=request.args.get("pitcher_hand"),
+            start_date=request.args.get("start_date"),
+            end_date=request.args.get("end_date"),
+            limit=int(request.args.get("limit", 5000)))
+        return jsonify({"success": True, "data": data, "count": len(data)})
+    except Exception as e:
+        log.exception("api_player_spray failed")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/optimize/<player_id>", methods=["GET", "POST"])
+def api_optimize_and_visualize(player_id: str):
+    """Full optimization pipeline via the API adapter."""
+    err = _require_api_adapter()
+    if err:
+        return err
+    try:
+        if request.method == "POST":
+            payload = request.get_json(force=True) or {}
+            pitcher_hand = payload.get("pitcher_hand", "R")
+            start_date = payload.get("start_date")
+            end_date = payload.get("end_date")
+            bg_path = payload.get("background_image_path", DEFAULT_BACKGROUND)
+        else:
+            pitcher_hand = request.args.get("pitcher_hand", "R")
+            start_date = request.args.get("start_date")
+            end_date = request.args.get("end_date")
+            bg_path = request.args.get("background_image_path", DEFAULT_BACKGROUND)
+
+        spray_data = fetch_player_spray(
+            player_id=player_id, pitcher_hand=pitcher_hand,
+            start_date=start_date, end_date=end_date, limit=1000)
+        if not spray_data:
+            return jsonify({"success": False, "error": "No spray data found"}), 404
+
+        from data_loader import parse_spray_to_dataframe
+        df = parse_spray_to_dataframe(spray_data)
+        if df.empty:
+            return jsonify({"success": False, "error": "Failed to parse spray data"}), 400
+
+        df = df.dropna(subset=["x", "y", "hang_time"])
+        if len(df) < MIN_QUALIFYING_BALLS:
+            return jsonify({
+                "success": False,
+                "error": f"Insufficient data: {len(df)} rows (need {MIN_QUALIFYING_BALLS})"
+            }), 400
+
+        from mlb_to_logical_converter import convert_dataframe_mlb_to_logical
+        from excel_grid_to_logical_converter import convert_optimizer_positions_to_logical
+        from outfield_region import OutfieldRegionManager
+
+        df_logical = convert_dataframe_mlb_to_logical(df, mlb_x_col="x", mlb_y_col="y")
+        positions_logical = convert_optimizer_positions_to_logical(
+            optimize_outfield_excel(df_logical))
+
+        label = f"Player {player_id[:8]}"
+        img_b64 = make_plot_with_image(
+            df, positions=positions_logical, batter_label=label,
+            pitcher_hand="RHP" if pitcher_hand.upper() == "R" else "LHP",
+            background_image_path=bg_path)
+
+        mgr = OutfieldRegionManager("outfield_region_config.json")
+        positions_pixel = {
+            n: (float(mgr.logical_to_pixel((lx, ly))[0]),
+                float(mgr.logical_to_pixel((lx, ly))[1]))
+            for n, (lx, ly) in positions_logical.items()
+        }
+
+        return jsonify({
+            "success": True,
+            "image_base64": img_b64,
+            "positions": positions_pixel,
+            "positions_logical": {k: (float(v[0]), float(v[1]))
+                                  for k, v in positions_logical.items()},
+            "data_count": len(df),
+            "batter_label": label,
+            "player_id": player_id,
+            "pitcher_hand": pitcher_hand,
+        })
+    except Exception as e:
+        log.exception("api_optimize_and_visualize failed")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ═════════════════════════════════════════════════════════
+#  PDF SCOUTING REPORT
+# ═════════════════════════════════════════════════════════
+
 @app.route("/api/pdf/<batter_id>", methods=["GET"])
 def api_pdf(batter_id: str):
     """
-    Generate a downloadable PDF scouting report for a batter.
-
-    Produces a portrait 8.5×11 inch page with:
-        - Player name header
-        - vs RHP spray chart on top
-        - vs LHP spray chart on bottom
-
-    Query parameters (optional):
-        batter_name: display name override
-        batter_hand: batting handedness override ("L" / "R")
-
-    Returns:
-        PDF file attachment
+    Generate a portrait 8.5×11 PDF with vs RHP (top) and
+    vs LHP (bottom) spray charts stacked vertically.
     """
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas as rl_canvas
         from reportlab.lib.utils import ImageReader
     except ImportError:
-        log.error("reportlab is not installed — run: pip install reportlab")
         return jsonify({
             "ok": False,
-            "error": "PDF generation requires the 'reportlab' package. Ask your admin to run: pip install reportlab"
+            "error": "reportlab not installed — run: pip install reportlab"
         }), 500
 
     try:
         from PIL import Image as PILImage
 
-        client_batter_name = request.args.get("batter_name")
-        client_batter_hand = request.args.get("batter_hand")
+        client_name = request.args.get("batter_name")
+        client_hand = request.args.get("batter_hand")
 
-        # Generate charts for both pitcher hands
-        rhp_result, rhp_label = _load_spray_for_pitcher_hand(
-            batter_id, "RHP",
-            client_batter_name=client_batter_name,
-            client_batter_hand=client_batter_hand,
-        )
+        rhp_img, rhp_label = load_spray_and_render(
+            batter_id, "RHP", client_name, client_hand)
+        lhp_img, lhp_label = load_spray_and_render(
+            batter_id, "LHP", client_name, client_hand)
 
-        lhp_result, lhp_label = _load_spray_for_pitcher_hand(
-            batter_id, "LHP",
-            client_batter_name=client_batter_name,
-            client_batter_hand=client_batter_hand,
-        )
-
-        if rhp_result is None and lhp_result is None:
+        if rhp_img is None and lhp_img is None:
             return jsonify({
                 "ok": False,
-                "error": f"Could not generate charts. RHP: {rhp_label}. LHP: {lhp_label}"
+                "error": f"No data. RHP: {rhp_label}. LHP: {lhp_label}"
             }), 404
 
-        # --- Compose PDF (portrait 8.5 x 11) ---
-        page_w, page_h = letter  # 612 x 792 points
-
+        page_w, page_h = letter  # 612 × 792 pt
         buf = io.BytesIO()
         c = rl_canvas.Canvas(buf, pagesize=letter)
 
-        player_display_name = (rhp_label or lhp_label or "Unknown Player")
-
-        # Title — compact header
+        player_name = rhp_label or lhp_label or "Unknown Player"
         margin = 24
-        c.setFont("Helvetica-Bold", 18)
-        c.drawCentredString(page_w / 2, page_h - 32, f"SLUGGER Scouting Report \u2014 {player_display_name}")
 
-        # Layout: two charts stacked vertically
-        # Available height below the title
+        # Title
+        c.setFont("Helvetica-Bold", 18)
+        c.drawCentredString(page_w / 2, page_h - 32,
+                            f"SLUGGER Scouting Report \u2014 {player_name}")
+
+        # Chart layout
         header_bottom = page_h - 46
-        gap = 8  # small gap between charts
-        chart_area_w = page_w - 2 * margin
-        chart_area_h = (header_bottom - margin - gap) / 2
+        gap = 8
+        chart_w = page_w - 2 * margin
+        chart_h = (header_bottom - margin - gap) / 2
 
         def draw_chart(img_b64, y_bottom, label):
-            """Draw a single chart image onto the PDF canvas."""
             if img_b64 is None:
                 c.setFont("Helvetica", 12)
                 c.setFillColorRGB(0.5, 0.5, 0.5)
-                c.drawCentredString(
-                    page_w / 2,
-                    y_bottom + chart_area_h / 2,
-                    f"No data available ({label})"
-                )
+                c.drawCentredString(page_w / 2, y_bottom + chart_h / 2,
+                                    f"No data available ({label})")
                 c.setFillColorRGB(0, 0, 0)
                 return
-
             img_bytes = base64.b64decode(img_b64)
-            img_pil = PILImage.open(io.BytesIO(img_bytes))
+            pil = PILImage.open(io.BytesIO(img_bytes))
+            scale = min(chart_w / pil.width, chart_h / pil.height)
+            dw, dh = pil.width * scale, pil.height * scale
+            c.drawImage(
+                ImageReader(io.BytesIO(img_bytes)),
+                margin + (chart_w - dw) / 2,
+                y_bottom + (chart_h - dh) / 2,
+                width=dw, height=dh)
 
-            img_w, img_h = img_pil.size
-            scale = min(chart_area_w / img_w, chart_area_h / img_h)
-            draw_w = img_w * scale
-            draw_h = img_h * scale
-
-            # Center in the slot
-            draw_x = margin + (chart_area_w - draw_w) / 2
-            draw_y = y_bottom + (chart_area_h - draw_h) / 2
-
-            img_reader = ImageReader(io.BytesIO(img_bytes))
-            c.drawImage(img_reader, draw_x, draw_y, width=draw_w, height=draw_h)
-
-        # Top chart: vs RHP
-        top_y = header_bottom - chart_area_h
-        draw_chart(rhp_result, top_y, "vs RHP")
-
-        # Bottom chart: vs LHP
-        bottom_y = top_y - gap - chart_area_h
-        draw_chart(lhp_result, bottom_y, "vs LHP")
+        top_y = header_bottom - chart_h
+        draw_chart(rhp_img, top_y, "vs RHP")
+        draw_chart(lhp_img, top_y - gap - chart_h, "vs LHP")
 
         c.save()
         buf.seek(0)
 
-        safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", player_display_name.split("(")[0].strip())
-        filename = f"SLUGGER_{safe_name}_report.pdf"
-
-        return send_file(
-            buf,
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name=filename,
-        )
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", player_name.split("(")[0].strip())
+        return send_file(buf, mimetype="application/pdf",
+                         as_attachment=True,
+                         download_name=f"SLUGGER_{safe}_report.pdf")
 
     except Exception as e:
         log.exception("api_pdf failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# -------------------------------------------------------
-# APPLICATION ENTRYPOINT
-# -------------------------------------------------------
-# Run the Flask server if this file is executed directly.
-# In production (Railway, Render, etc.), you typically use:
-#   gunicorn app:app
-# but this local entrypoint allows easy development testing.
+# ═════════════════════════════════════════════════════════
+#  ENTRYPOINT
+# ═════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Host 0.0.0.0 makes the server accessible externally
-    # Port 8080 aligns with common platform defaults (Railway, Render)
     app.run(host="0.0.0.0", port=8080)
