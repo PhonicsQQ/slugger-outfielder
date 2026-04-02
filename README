@@ -1,10 +1,10 @@
 # SLUGGER Outfielder Placement Optimization Widget
 
-This semester, I worked as one of the SLUGGER widget developers under the SLUGGER platform team to create an Outfielder Optimization Widget. The project uses Trackman batter ball data through the SLUGGER API to compute optimal defensive placements for left field, center field, and right field. A grid based optimization framework, inspired by Dr. D's prior spreadsheet-based methods, estimates outfielder positioning that minimizes expected run value given a hitter's spray tendencies and batted-ball parameters. The widget integrates backend data processing in Python with a web based visualization interface, where positioning recommendations are overlaid on a real ballpark photograph.
+This semester, I worked as one of the SLUGGER widget developers under the SLUGGER platform team to create an Outfielder Optimization Widget. The project uses Trackman batter ball data through the SLUGGER API to compute optimal defensive placements for left field, center field, and right field. A grid based optimization framework, inspired by Dr. D's prior spreadsheet based methods, estimates outfielder positioning that minimizes expected run value given a hitter's spray tendencies and batted-ball parameters. The widget integrates backend data processing in Python with a web based visualization interface, where positioning recommendations are overlaid on a real ballpark photograph.
 
 ## Key Features
-- **Hitter-Specific Spray Charts** — Batter data is plotted over a ballpark background image using direction and distance to map each hit to its correct outfield location. Outcomes (out, single, double) are color coded by proximity to the optimized fielder positions.
-- **Grid-Based Optimization Framework** — Outfielder placements are computed by dividing spray dots into LF/CF/RF zones and placing each fielder at the centroid of their zone, minimizing total distance to batted balls.
+- **Hitter Specific Spray Charts** — Batter data is plotted over a ballpark background image using direction and distance to map each hit to its correct outfield location. Outcomes (out, single, double) are color coded by proximity to the optimized fielder positions.
+- **Grid Based Optimization Framework** — Outfielder placements are computed by dividing spray dots into LF/CF/RF zones and placing each fielder at the centroid of their zone, minimizing total distance to batted balls.
 - **Interactive Web Interface** — A React frontend allows users to select any batter from the player dropdown, choose pitcher handedness (RHP or LHP), and generate a spray chart with optimized positions in one click.
 - **PDF Scouting Report** — After generating a chart, a "Print PDF" button appears that downloads a portrait 8.5×11 PDF with both the vs RHP and vs LHP spray charts stacked vertically under a header with the player's name.
 - **Background Player Probe** — On startup, the app asynchronously probes which players have enough qualifying outfield data, progressively filtering the dropdown to only show players with usable spray data.
@@ -26,8 +26,8 @@ This semester, I worked as one of the SLUGGER widget developers under the SLUGGE
 2. Select a batter from the dropdown
 3. Choose pitcher handedness (RHP or LHP)
 4. Click **Generate Positions** to view the spray chart with optimized outfielder placements
-5. Click **Print PDF** (bottom-left corner) to download a scouting report with both pitcher-hand charts
+5. Click **Print PDF** (bottom left corner) to download a scouting report with both pitcher-hand charts
 
 ## Acknowledgements
 
-This project was developed in collaboration with the SLUGGER platform team and is inspired by Excel-based defensive positioning workflows originally developed by Dr. D during his work with Major League Baseball.
+This project was developed in collaboration with the SLUGGER platform team and is inspired by Excel based defensive positioning workflows originally developed by Dr. D during his work with Major League Baseball.
