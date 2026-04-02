@@ -96,6 +96,32 @@
       cursor: not-allowed;
     }
 
+    .btn-pdf {
+      position: fixed;
+      bottom: 24px;
+      left: 24px;
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #fff;
+      background: #1a5276;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      z-index: 1000;
+      transition: background 0.15s, opacity 0.15s;
+    }
+
+    .btn-pdf:hover {
+      background: #1f6f9f;
+    }
+
+    .btn-pdf:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
     .status-line {
       font-size: 12px;
       color: #888;
@@ -172,6 +198,13 @@
       const [error, setError] = useState(null);
       const [playerCount, setPlayerCount] = useState(0);
 
+      // PDF state
+      const [pdfReady, setPdfReady] = useState(false);
+      const [pdfLoading, setPdfLoading] = useState(false);
+      const [computedBatterId, setComputedBatterId] = useState(null);
+      const [computedBatterName, setComputedBatterName] = useState("");
+      const [computedBatterHand, setComputedBatterHand] = useState("");
+
       // Load batters on mount
       useEffect(() => {
         fetch("/api/batters")
@@ -228,6 +261,7 @@
         setLoading(true);
         setError(null);
         setImageBase64(null);
+        setPdfReady(false);
 
         const batter = batters[selectedBatter] || {};
 
@@ -246,6 +280,16 @@
             if (data.ok) {
               setImageBase64(data.image_base64);
               setBatterLabel(data.batter_label || batter.label || "");
+
+              // Enable PDF download
+              setComputedBatterId(selectedBatter);
+              setComputedBatterName(
+                data.batter_label
+                  ? data.batter_label.split("(")[0].trim()
+                  : batter.batter_name || ""
+              );
+              setComputedBatterHand(data.batter_hand || batter.batter_hand || "");
+              setPdfReady(true);
             } else {
               setError(data.error || "Failed to generate positions.");
             }
@@ -254,6 +298,50 @@
           .catch((err) => {
             setError("Network error — is the server running?");
             setLoading(false);
+          });
+      };
+
+      const handlePdfDownload = () => {
+        if (!computedBatterId || pdfLoading) return;
+        setPdfLoading(true);
+
+        // Build URL with properly encoded query params
+        let url = `/api/pdf/${encodeURIComponent(computedBatterId)}`;
+        const params = [];
+        if (computedBatterName) params.push(`batter_name=${encodeURIComponent(computedBatterName)}`);
+        if (computedBatterHand) params.push(`batter_hand=${encodeURIComponent(computedBatterHand)}`);
+        if (params.length > 0) url += `?${params.join("&")}`;
+
+        fetch(url)
+          .then((response) => {
+            if (!response.ok) {
+              return response.text().then((text) => {
+                try {
+                  const err = JSON.parse(text);
+                  throw new Error(err.error || "PDF generation failed");
+                } catch (parseErr) {
+                  if (parseErr.message && parseErr.message !== "PDF generation failed") throw parseErr;
+                  throw new Error("PDF generation failed (server error " + response.status + ")");
+                }
+              });
+            }
+            return response.blob();
+          })
+          .then((blob) => {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `SLUGGER_${(computedBatterName || "report").replace(/\s+/g, "_")}_report.pdf`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+          })
+          .catch((err) => {
+            alert("PDF generation failed: " + err.message);
+          })
+          .finally(() => {
+            setPdfLoading(false);
           });
       };
 
@@ -329,6 +417,17 @@
               </p>
             )}
           </div>
+
+          {/* Print PDF button — fixed bottom-left, appears after a chart is generated */}
+          {pdfReady && (
+            <button
+              className="btn-pdf"
+              onClick={handlePdfDownload}
+              disabled={pdfLoading}
+            >
+              {pdfLoading ? "⏳ Generating PDF…" : "📄 Print PDF"}
+            </button>
+          )}
         </div>
       );
     }

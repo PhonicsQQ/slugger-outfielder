@@ -30,8 +30,6 @@ if sys.platform == 'win32':
             line_buffering=True
         )
 
-
-# Imports!
 from flask import Flask, request, jsonify, render_template_string, render_template, send_file
 import numpy as np
 import pandas as pd
@@ -329,7 +327,7 @@ def make_plot(df: pd.DataFrame,
 
     # Draw optimized LF/CF/RF boxes
     box_w, box_h = 12, 12
-    for name, (cx, cy) in positions.items():
+    for name, (cx, cy) in (positions or {}).items():
         rect = Rectangle(
             (cx - box_w/2, cy - box_h/2),
             box_w, box_h,
@@ -519,8 +517,7 @@ def make_plot_with_image(
 
     if len(df) > 0:
         for idx, row in df.iterrows():
-            log.info(f"[DEBUG] x range: {df['x'].min():.1f} to {df['x'].max():.1f}")
-            log.info(f"[DEBUG] y range: {df['y'].min():.1f} to {df['y'].max():.1f}")
+            
             mlb_x = row["x"]
             mlb_y = row["y"]
 
@@ -571,12 +568,11 @@ def make_plot_with_image(
            
 
             color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
-            balls_pixel.append((pixel_x, pixel_y, color, dist_f))
+            balls_pixel.append((pixel_x, pixel_y, color))
 
     # -------------------------------------------------------
     # Calculate optimized fielder positions from spray dot locations
-    # Place each fielder at the depth-weighted centroid of spray dots
-    # in their zone — deeper balls pull the fielder back harder.
+    # Place each fielder at the centroid of spray dots in their zone
     # -------------------------------------------------------
     optimized_pixel = {}
 
@@ -590,49 +586,21 @@ def make_plot_with_image(
         cf_dots = sorted_dots[third:2*third]
         rf_dots = sorted_dots[2*third:]
 
-        SHALLOW_CUTOFF = 200.0
-        DEEP_CUTOFF    = 300.0
-        SHALLOW_W      = 0.5
-        MEDIUM_W       = 1.0
-        DEEP_W         = 1.5
-
         for name, dots in [("LF", lf_dots), ("CF", cf_dots), ("RF", rf_dots)]:
             if dots:
-                total_w = 0.0
-                wx_sum = 0.0
-                wy_sum = 0.0
-                for (px, py, _, dist) in dots:
-                    if dist < SHALLOW_CUTOFF:
-                        w = SHALLOW_W
-                    elif dist > DEEP_CUTOFF:
-                        w = DEEP_W
-                    else:
-                        w = MEDIUM_W
-                    wx_sum += w * px
-                    wy_sum += w * py
-                    total_w += w
-                optimized_pixel[name] = (wx_sum / total_w, wy_sum / total_w)
+                avg_x = sum(d[0] for d in dots) / len(dots)
+                avg_y = sum(d[1] for d in dots) / len(dots)
+                optimized_pixel[name] = (avg_x, avg_y)
 
     # -------------------------------------------------------
-    # Reassign outcomes: depth-aware with outcome caps
-    #
-    # Shallow balls (< 200 ft) are capped at SINGLE — they
-    # don't have the energy to roll past a charging outfielder.
-    # Medium balls (200-300 ft) can be OUT/SINGLE/DOUBLE.
-    # Deep balls (300+ ft) get the full outcome range.
-    #
-    # Within each depth band, fielder proximity still determines
-    # the specific outcome, so positioning matters everywhere —
-    # but the ceiling is realistic.
+    # Reassign outcomes based on pixel-space distance to nearest fielder
+    # Outs cluster around fielders, hits land in gaps
     # -------------------------------------------------------
-    SHALLOW_CUTOFF = 200.0
-    DEEP_CUTOFF    = 300.0
-
     if balls_pixel and optimized_pixel:
         fielder_positions = list(optimized_pixel.values())
         min_dists = []
 
-        for (px, py, _, _) in balls_pixel:
+        for (px, py, _) in balls_pixel:
             d = min(np.hypot(px - fx, py - fy) for fx, fy in fielder_positions)
             min_dists.append(d)
 
@@ -647,29 +615,13 @@ def make_plot_with_image(
         }
 
         new_balls = []
-        for i, (px, py, _, dist) in enumerate(balls_pixel):
-            # Base outcome from fielder proximity (same as before)
+        for i, (px, py, _) in enumerate(balls_pixel):
             if min_dists[i] <= p65:
-                base_outcome = "OUT"
+                outcome = "OUT"
             elif min_dists[i] <= p90:
-                base_outcome = "SINGLE"
+                outcome = "SINGLE"
             else:
-                base_outcome = "DOUBLE"
-
-            # Apply depth-based outcome cap
-            if dist < SHALLOW_CUTOFF:
-                # Shallow blooper — capped at SINGLE
-                if base_outcome == "DOUBLE":
-                    outcome = "SINGLE"
-                else:
-                    outcome = base_outcome
-            elif dist < DEEP_CUTOFF:
-                # Medium depth — full OUT/SINGLE/DOUBLE range
-                outcome = base_outcome
-            else:
-                # Deep ball — full range (DOUBLE is realistic here)
-                outcome = base_outcome
-
+                outcome = "DOUBLE"
             new_balls.append((px, py, outcome_colors[outcome]))
 
         balls_pixel = new_balls
@@ -1122,84 +1074,6 @@ def api_cache_status():
         "probed": len(_players_with_data_cache),
         "total": len(players)
     })
-
-
-@app.route("/api/batters", methods=["GET"])
-def api_batters():
-    """
-    Return the player list as JSON for the React frontend.
-    Reuses the same loading logic as the index route.
-    """
-    batters = {}
-
-    if USE_JSON_LOADER:
-        try:
-            players_with_data = get_unique_players_with_spray_data()
-            seen_names = set()
-            for player in players_with_data:
-                player_id = player.get("player_id")
-                player_name = player.get("player_name", "Unknown")
-                batting_hand = (player.get("player_batting_handedness") or "").upper()
-                if batting_hand in ["LEFT", "L"]:
-                    hand_suffix = "L"
-                elif batting_hand in ["RIGHT", "R"]:
-                    hand_suffix = "R"
-                else:
-                    hand_suffix = "U"
-                name_clean = player_name.strip()
-                if not name_clean or len(name_clean) < 2:
-                    continue
-                if name_clean.startswith(",") or not re.search(r"[a-zA-Z0-9]", name_clean):
-                    continue
-                key_pair = (name_clean, hand_suffix)
-                if key_pair in seen_names:
-                    continue
-                seen_names.add(key_pair)
-                batters[player_id] = {
-                    "label": f"{name_clean} ({hand_suffix})",
-                    "batter_name": name_clean,
-                    "batter_hand": hand_suffix,
-                    "player_id": player_id,
-                }
-        except Exception:
-            log.exception("Failed to load batters for API")
-
-    elif USE_API_ADAPTER:
-        try:
-            players = fetch_players(limit=1000)
-            seen_names = set()
-            for player in players:
-                player_id = player.get("player_id")
-                player_name = (player.get("player_name") or "").strip()
-                if not player_id or not player_name or len(player_name) < 2:
-                    continue
-                if player_name.startswith(",") or not re.search(r"[a-zA-Z0-9]", player_name):
-                    continue
-                batting_hand = (player.get("player_batting_handedness") or "").upper()
-                if batting_hand in ("LEFT", "L"):
-                    hand = "L"
-                elif batting_hand in ("RIGHT", "R"):
-                    hand = "R"
-                else:
-                    hand = "U"
-                key_pair = (player_name, hand)
-                if key_pair in seen_names:
-                    continue
-                seen_names.add(key_pair)
-                batters[player_id] = {
-                    "label": f"{player_name} ({hand})",
-                    "batter_name": player_name,
-                    "batter_hand": hand,
-                    "player_id": player_id,
-                }
-        except Exception:
-            log.exception("Failed to load batters from API")
-
-    if not batters:
-        batters = BATTERS
-
-    return jsonify({"ok": True, "batters": batters})
-
 
 @app.route("/api/compute", methods=["POST"])
 def api_compute():
@@ -1778,6 +1652,286 @@ def api_optimize_and_visualize(player_id: str):
             "success": False,
             "error": str(e)
         }), 500
+
+# -------------------------------------------------------
+# PDF DOWNLOAD ENDPOINT
+# -------------------------------------------------------
+# Generates a landscape 11×8.5 PDF with spray charts for
+# both pitcher hands (vs RHP and vs LHP) side by side.
+# -------------------------------------------------------
+
+def _load_spray_for_pitcher_hand(batter_id, pitcher_hand_label, client_batter_name=None, client_batter_hand=None):
+    """
+    Internal helper: loads spray data and generates a chart image (base64 PNG)
+    for a given batter + pitcher hand combination.
+
+    Reuses the same data-loading logic as /api/compute.
+
+    Returns:
+        (img_b64, batter_label) or (None, error_string)
+    """
+    background_image_path = "img/background.png"
+
+    # --- API ADAPTER MODE ---
+    if USE_API_ADAPTER and not USE_JSON_LOADER:
+        pitcher_hand_for_api = pitcher_hand_label.replace("HP", "").upper()
+
+        spray_data = fetch_player_spray(
+            player_id=batter_id,
+            pitcher_hand=pitcher_hand_for_api,
+            start_date=None,
+            end_date=None,
+            limit=1000,
+        )
+
+        if not spray_data:
+            return None, f"No spray data for {pitcher_hand_label}"
+
+        from data_loader import parse_spray_to_dataframe
+        df = parse_spray_to_dataframe(spray_data)
+
+        if df.empty:
+            return None, f"No qualifying outfield data for {pitcher_hand_label}"
+
+        df_filtered = df.dropna(subset=["x", "y"])
+
+        if len(df_filtered) < MIN_QUALIFYING_BALLS:
+            return None, f"Only {len(df_filtered)} balls for {pitcher_hand_label} (need {MIN_QUALIFYING_BALLS})"
+
+        df_filtered = df_filtered.copy()
+        df_filtered["hang_time"] = df_filtered["hang_time"].fillna(3.0)
+        df_filtered["outcome"] = df_filtered["outcome"].fillna("OUT")
+        df = df_filtered
+
+        # Resolve batter name
+        if client_batter_name and client_batter_name.strip():
+            name = client_batter_name.strip()
+            raw_hand = client_batter_hand or "R"
+        else:
+            try:
+                players = fetch_players(limit=5000)
+                match = next(
+                    (p for p in players if p.get("player_id") == batter_id), None
+                )
+                if match:
+                    name = match.get("player_name") or f"Player {batter_id[:8]}"
+                    raw_hand = match.get("player_batting_handedness") or "R"
+                else:
+                    name = f"Player {batter_id[:8]}"
+                    raw_hand = "R"
+            except Exception:
+                name = f"Player {batter_id[:8]}"
+                raw_hand = "R"
+
+        if str(raw_hand).upper() in ("LEFT", "L"):
+            bh = "L"
+        elif str(raw_hand).upper() in ("RIGHT", "R"):
+            bh = "R"
+        else:
+            bh = "U"
+
+        batter_label = f"{name} ({bh})"
+
+    # --- JSON LOADER MODE ---
+    elif USE_JSON_LOADER:
+        players_with_data = get_unique_players_with_spray_data()
+        player_ids = {p.get("player_id") for p in players_with_data}
+
+        if batter_id in player_ids:
+            selected = next(
+                p for p in players_with_data if p.get("player_id") == batter_id
+            )
+            name = selected.get("player_name", "Unknown")
+            raw_hand = (selected.get("player_batting_handedness") or "").upper()
+            if raw_hand in ["LEFT", "L"]:
+                bh = "L"
+            elif raw_hand in ["RIGHT", "R"]:
+                bh = "R"
+            else:
+                bh = "U"
+            batter_label = f"{name} ({bh})"
+            df = get_player_spray_dataframe(batter_id)
+
+            if df.empty or df.dropna(subset=["x", "y"]).shape[0] < MIN_QUALIFYING_BALLS:
+                df_drawn = generate_spray("dickerson_R", pitcher_hand_label)
+                df = df_drawn.copy()
+                df["x"] = (df_drawn["x"] - 150) * 0.5
+                df["y"] = (df_drawn["y"] - 200) * 2.0
+                df["hang_time"] = 3.0
+                positions_drawn = optimize_outfield(df_drawn)
+                df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+                df["outcome"] = df_drawn["outcome"].values[:len(df)]
+            else:
+                df = df.dropna(subset=["x", "y"])
+                df["hang_time"] = df["hang_time"].fillna(3.0)
+                df["outcome"] = df["outcome"].fillna("OUT")
+        elif batter_id in BATTERS:
+            meta = BATTERS[batter_id]
+            batter_label = meta["label"]
+            df_drawn = generate_spray(batter_id, pitcher_hand_label)
+            df = df_drawn.copy()
+            df["x"] = (df_drawn["x"] - 150) * 0.5
+            df["y"] = (df_drawn["y"] - 200) * 2.0
+            df["hang_time"] = 3.0
+            positions_drawn = optimize_outfield(df_drawn)
+            df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+            df["outcome"] = df_drawn["outcome"].values[:len(df)]
+        else:
+            return None, "Unknown batter"
+
+    # --- SYNTHETIC MODE ---
+    else:
+        if batter_id not in BATTERS:
+            return None, "Unknown batter"
+        meta = BATTERS[batter_id]
+        batter_label = meta["label"]
+        df_drawn = generate_spray(batter_id, pitcher_hand_label)
+        df = df_drawn.copy()
+        df["x"] = (df_drawn["x"] - 150) * 0.5
+        df["y"] = (df_drawn["y"] - 200) * 2.0
+        df["hang_time"] = 3.0
+        positions_drawn = optimize_outfield(df_drawn)
+        df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
+        df["outcome"] = df_drawn["outcome"].values[:len(df)]
+
+    # Generate the chart
+    img_b64 = make_plot_with_image(
+        df,
+        positions=None,
+        batter_label=batter_label,
+        pitcher_hand=pitcher_hand_label,
+        background_image_path=background_image_path,
+    )
+
+    return img_b64, batter_label
+
+
+@app.route("/api/pdf/<batter_id>", methods=["GET"])
+def api_pdf(batter_id: str):
+    """
+    Generate a downloadable PDF scouting report for a batter.
+
+    Produces a portrait 8.5×11 inch page with:
+        - Player name header
+        - vs RHP spray chart on top
+        - vs LHP spray chart on bottom
+
+    Query parameters (optional):
+        batter_name: display name override
+        batter_hand: batting handedness override ("L" / "R")
+
+    Returns:
+        PDF file attachment
+    """
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas as rl_canvas
+        from reportlab.lib.utils import ImageReader
+    except ImportError:
+        log.error("reportlab is not installed — run: pip install reportlab")
+        return jsonify({
+            "ok": False,
+            "error": "PDF generation requires the 'reportlab' package. Ask your admin to run: pip install reportlab"
+        }), 500
+
+    try:
+        from PIL import Image as PILImage
+
+        client_batter_name = request.args.get("batter_name")
+        client_batter_hand = request.args.get("batter_hand")
+
+        # Generate charts for both pitcher hands
+        rhp_result, rhp_label = _load_spray_for_pitcher_hand(
+            batter_id, "RHP",
+            client_batter_name=client_batter_name,
+            client_batter_hand=client_batter_hand,
+        )
+
+        lhp_result, lhp_label = _load_spray_for_pitcher_hand(
+            batter_id, "LHP",
+            client_batter_name=client_batter_name,
+            client_batter_hand=client_batter_hand,
+        )
+
+        if rhp_result is None and lhp_result is None:
+            return jsonify({
+                "ok": False,
+                "error": f"Could not generate charts. RHP: {rhp_label}. LHP: {lhp_label}"
+            }), 404
+
+        # --- Compose PDF (portrait 8.5 x 11) ---
+        page_w, page_h = letter  # 612 x 792 points
+
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=letter)
+
+        player_display_name = (rhp_label or lhp_label or "Unknown Player")
+
+        # Title — compact header
+        margin = 24
+        c.setFont("Helvetica-Bold", 18)
+        c.drawCentredString(page_w / 2, page_h - 32, f"SLUGGER Scouting Report \u2014 {player_display_name}")
+
+        # Layout: two charts stacked vertically
+        # Available height below the title
+        header_bottom = page_h - 46
+        gap = 8  # small gap between charts
+        chart_area_w = page_w - 2 * margin
+        chart_area_h = (header_bottom - margin - gap) / 2
+
+        def draw_chart(img_b64, y_bottom, label):
+            """Draw a single chart image onto the PDF canvas."""
+            if img_b64 is None:
+                c.setFont("Helvetica", 12)
+                c.setFillColorRGB(0.5, 0.5, 0.5)
+                c.drawCentredString(
+                    page_w / 2,
+                    y_bottom + chart_area_h / 2,
+                    f"No data available ({label})"
+                )
+                c.setFillColorRGB(0, 0, 0)
+                return
+
+            img_bytes = base64.b64decode(img_b64)
+            img_pil = PILImage.open(io.BytesIO(img_bytes))
+
+            img_w, img_h = img_pil.size
+            scale = min(chart_area_w / img_w, chart_area_h / img_h)
+            draw_w = img_w * scale
+            draw_h = img_h * scale
+
+            # Center in the slot
+            draw_x = margin + (chart_area_w - draw_w) / 2
+            draw_y = y_bottom + (chart_area_h - draw_h) / 2
+
+            img_reader = ImageReader(io.BytesIO(img_bytes))
+            c.drawImage(img_reader, draw_x, draw_y, width=draw_w, height=draw_h)
+
+        # Top chart: vs RHP
+        top_y = header_bottom - chart_area_h
+        draw_chart(rhp_result, top_y, "vs RHP")
+
+        # Bottom chart: vs LHP
+        bottom_y = top_y - gap - chart_area_h
+        draw_chart(lhp_result, bottom_y, "vs LHP")
+
+        c.save()
+        buf.seek(0)
+
+        safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", player_display_name.split("(")[0].strip())
+        filename = f"SLUGGER_{safe_name}_report.pdf"
+
+        return send_file(
+            buf,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=filename,
+        )
+
+    except Exception as e:
+        log.exception("api_pdf failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # -------------------------------------------------------
 # APPLICATION ENTRYPOINT
