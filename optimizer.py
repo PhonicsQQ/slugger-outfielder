@@ -49,15 +49,15 @@ PENALTY_REWARD = {
 DEFAULT_GRID_PARAMS = {
     "RF": {
         "min_x": 180, "max_x": 200, "step_x": 10,
-        "min_y": 80,  "max_y": 110, "step_y": 10
+        "min_y": 80,  "max_y": 130, "step_y": 10   # was 110
     },
     "CF": {
         "min_x": 105, "max_x": 145, "step_x": 10,
-        "min_y": 60,  "max_y": 90,  "step_y": 10
+        "min_y": 60,  "max_y": 110, "step_y": 10   # was 90
     },
     "LF": {
         "min_x": 40,  "max_x": 70,  "step_x": 10,
-        "min_y": 80,  "max_y": 110, "step_y": 10
+        "min_y": 80,  "max_y": 130, "step_y": 10   # was 110
     }
 }
 
@@ -217,10 +217,10 @@ def calculate_date_weight(
 
 DEPTH_WEIGHT_CONFIG = {
     "shallow_cutoff": 200.0,   # feet — below this is a blooper
-    "deep_cutoff":    300.0,   # feet — above this is a deep fly
+    "deep_cutoff":    260.0,   # feet — above this is a deep fly
     "shallow_weight":   0.5,
     "medium_weight":    1.0,
-    "deep_weight":      1.5,
+    "deep_weight":      4.0,
 }
 
 

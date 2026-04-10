@@ -83,6 +83,19 @@ OUTCOME_COLORS = {
     "1B": "#42a5f5", "2B": "#e040fb", "3B": "#ffa726", "HR": "#ef5350",
 }
 
+# ── Depth-based weighting config ─────────────────────────
+# Deeper balls carry more positional leverage — mispositioning
+# on a deep fly is catastrophic, while shallow bloopers barely
+# matter.  These thresholds control both the optimizer weight
+# and the visualization outcome caps.
+DEPTH_WEIGHT_CONFIG = {
+    "shallow_cutoff": 200.0,   # feet — below this is a blooper
+    "deep_cutoff":    260.0,   # feet — above this is a deep fly
+    "shallow_weight":   0.5,
+    "medium_weight":    1.0,
+    "deep_weight":      4.0,   # ← bump this to push fielders deeper
+}
+
 
 # ═════════════════════════════════════════════════════════
 #  DATA SOURCE DETECTION
@@ -237,6 +250,18 @@ def _prepare_synthetic(batter_id: str, pitcher_hand: str):
     df_drawn = assign_distance_based_outcomes(df_drawn, positions_drawn)
     df["outcome"] = df_drawn["outcome"].values[: len(df)]
     return df, positions_drawn
+
+
+def _get_depth_weight(distance: float) -> float:
+    """Return depth-based importance weight for a batted ball distance."""
+    cfg = DEPTH_WEIGHT_CONFIG
+    if distance <= 0 or np.isnan(distance):
+        return cfg["medium_weight"]
+    if distance < cfg["shallow_cutoff"]:
+        return cfg["shallow_weight"]
+    elif distance > cfg["deep_cutoff"]:
+        return cfg["deep_weight"]
+    return cfg["medium_weight"]
 
 
 # ═════════════════════════════════════════════════════════
@@ -462,7 +487,9 @@ def make_plot_with_image(
     ax.set_xlim(0, img_w)
     ax.set_ylim(img_h, 0)
 
-    # Map each ball to pixel coordinates via direction + distance
+    # ── Map each ball to pixel coordinates via direction + distance ──
+    # Store as 4-tuple: (pixel_x, pixel_y, color, distance_ft)
+    # so depth info is available for centroid weighting and outcome caps.
     balls_pixel = []
     for idx, row in df.iterrows():
         if pd.isna(row["x"]) or pd.isna(row["y"]):
@@ -471,8 +498,10 @@ def make_plot_with_image(
         if dir_val is None or dist_val is None or pd.isna(dir_val) or pd.isna(dist_val):
             continue
 
+        dist_f = float(dist_val)
+
         depth_frac = np.clip(
-            (float(dist_val) - cfg["dist_min"]) / (cfg["dist_max"] - cfg["dist_min"]),
+            (dist_f - cfg["dist_min"]) / (cfg["dist_max"] - cfg["dist_min"]),
             0.0, 1.0)
         pixel_y = int(cfg["outfield_bottom_px"]
                       - depth_frac * (cfg["outfield_bottom_px"] - cfg["outfield_top_px"]))
@@ -498,9 +527,20 @@ def make_plot_with_image(
             continue
 
         color = spray_colors.iloc[idx] if idx < len(spray_colors) else "#ffffff"
-        balls_pixel.append((pixel_x, pixel_y, color))
+        balls_pixel.append((pixel_x, pixel_y, color, dist_f))
 
-    # Compute fielder centroids from spray zones
+    # ── Fielder positioning: weighted X + depth percentile Y ──
+    # Lateral (X): depth-weighted centroid (same as before).
+    # Depth (Y):   place fielder at the 35th percentile of ball
+    #              pixel_y in the zone — meaning 65% of balls are
+    #              shallower (higher pixel_y) and 35% are deeper.
+    #              Lower percentile = closer to fence.
+    #              Adjust DEPTH_POSITION_PERCENTILE to taste:
+    #                20 = very aggressive (near fence)
+    #                35 = moderately deep (default)
+    #                50 = plain median
+    DEPTH_POSITION_PERCENTILE = 30
+
     optimized_pixel = {}
     if balls_pixel:
         sorted_dots = sorted(balls_pixel, key=lambda d: d[0])
@@ -509,33 +549,60 @@ def make_plot_with_image(
                            ("CF", sorted_dots[third:2*third]),
                            ("RF", sorted_dots[2*third:])]:
             if dots:
-                optimized_pixel[name] = (
-                    sum(d[0] for d in dots) / len(dots),
-                    sum(d[1] for d in dots) / len(dots),
-                )
+                # Weighted centroid for lateral position
+                total_w = 0.0
+                wx_sum = 0.0
+                for (px, py, _, dist) in dots:
+                    w = _get_depth_weight(dist)
+                    wx_sum += w * px
+                    total_w += w
+                avg_x = wx_sum / total_w
 
-    # Reassign outcome colours by proximity to fielders
+                # Percentile for depth — lower pixel_y = deeper
+                ys = [py for (_, py, _, _) in dots]
+                depth_y = float(np.percentile(ys, DEPTH_POSITION_PERCENTILE))
+
+                optimized_pixel[name] = (avg_x, depth_y)
+
+    # ── Depth-aware outcome reassignment ─────────────────
+    # Shallow balls (< shallow_cutoff) are capped at SINGLE.
+    # Deep balls get full OUT / SINGLE / DOUBLE range.
+    dcfg = DEPTH_WEIGHT_CONFIG
     if balls_pixel and optimized_pixel:
         fp = list(optimized_pixel.values())
         min_dists = np.array([
             min(np.hypot(px - fx, py - fy) for fx, fy in fp)
-            for px, py, _ in balls_pixel
+            for px, py, _, _ in balls_pixel
         ])
         p65 = np.percentile(min_dists, 65)
         p90 = np.percentile(min_dists, 90)
         oc = {"OUT": OUTCOME_COLORS["OUT"],
               "SINGLE": OUTCOME_COLORS["SINGLE"],
               "DOUBLE": OUTCOME_COLORS["DOUBLE"]}
-        balls_pixel = [
-            (px, py,
-             oc["OUT"] if min_dists[i] <= p65
-             else oc["SINGLE"] if min_dists[i] <= p90
-             else oc["DOUBLE"])
-            for i, (px, py, _) in enumerate(balls_pixel)
-        ]
+
+        new_balls = []
+        for i, (px, py, _, dist) in enumerate(balls_pixel):
+            # Base outcome from fielder proximity
+            if min_dists[i] <= p65:
+                base = "OUT"
+            elif min_dists[i] <= p90:
+                base = "SINGLE"
+            else:
+                base = "DOUBLE"
+
+            # Depth cap: shallow balls can never be doubles
+            if dist < dcfg["shallow_cutoff"] and base == "DOUBLE":
+                outcome = "SINGLE"
+            else:
+                outcome = base
+
+            new_balls.append((px, py, oc[outcome]))
+
+        balls_pixel = new_balls
 
     # Draw spray dots
-    for px, py, color in balls_pixel:
+    for entry in balls_pixel:
+        px, py, color = entry[0], entry[1], entry[2]
         ax.scatter(px, py, s=40, c=color, alpha=0.7,
                    edgecolor="white", linewidth=0.5, zorder=5)
 
@@ -673,7 +740,7 @@ def _probe_one_player(player_id: str) -> bool:
 
 def _start_background_probe(players: list) -> None:
     """Probe players for qualifying data in a background thread."""
-    batch = players[:500]
+    batch = players[:1000]
 
     def run():
         global _players_with_data_cache, _cache_ready
@@ -683,10 +750,10 @@ def _start_background_probe(players: list) -> None:
             pid = player.get("player_id")
             if not pid:
                 return pid, False
-            time.sleep(1.2)
+            time.sleep(0.5)
             return pid, _probe_one_player(pid)
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             for future in as_completed(
                 {pool.submit(probe, p): p for p in batch}
             ):
