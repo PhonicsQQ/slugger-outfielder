@@ -341,34 +341,62 @@ def fetch_players(team_name: Optional[str] = None,
                   start_date: Optional[str] = None,
                   end_date: Optional[str] = None,
                   limit: int = 5000) -> List[Dict]:
-    """Fetch player list."""
+    """Fetch player list, paginating until limit or exhaustion."""
+    PAGE_SIZE = 500
     url = f"{BASE_URL}/players"
-    params = {"limit": min(limit, 1000)}
 
+    baseParams = {}
     if team_name:
-        params["team_name"] = team_name
+        baseParams["team_name"] = team_name
 
     if handedness:
         h = handedness.upper()
         if h in ("LEFT", "L"):
-            params["player_batting_handedness"] = "Left"
+            baseParams["player_batting_handedness"] = "Left"
         elif h in ("RIGHT", "R"):
-            params["player_batting_handedness"] = "Right"
+            baseParams["player_batting_handedness"] = "Right"
         elif h in ("SWITCH", "S"):
-            params["player_batting_handedness"] = "Switch"
+            baseParams["player_batting_handedness"] = "Switch"
         else:
-            params["player_batting_handedness"] = handedness
+            baseParams["player_batting_handedness"] = handedness
 
     if not API_KEY:
         log.error("API_KEY missing.")
         return []
 
-    data = _get_with_retry(url, params, max_retries=2)
-    if data and data.get("success"):
-        return data.get("data", [])
+    allPlayers: List[Dict] = []
+    page = 1
 
-    log.error(f"fetch_players failed: {data}")
-    return []
+    while len(allPlayers) < limit:
+        params = dict(baseParams)
+        params["limit"] = PAGE_SIZE
+        params["page"] = page
+
+        log.info(
+            f"fetch_players: page={page} collected={len(allPlayers)}"
+        )
+
+        data = _get_with_retry(url, params, max_retries=2)
+
+        if not data or not data.get("success"):
+            log.error(f"fetch_players failed on page {page}: {data}")
+            break
+
+        pageRows = data.get("data", [])
+        log.info(f"Page {page} returned {len(pageRows)} players")
+
+        if not pageRows:
+            break
+
+        allPlayers.extend(pageRows)
+
+        # Last page reached
+        if len(pageRows) < PAGE_SIZE:
+            break
+
+        page += 1
+
+    return allPlayers[:limit]
 
 
 def fetch_batted_balls(player_ids: Optional[List[str]] = None,

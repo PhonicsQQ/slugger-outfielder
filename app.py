@@ -11,6 +11,8 @@ import threading
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -740,7 +742,7 @@ def _probe_one_player(player_id: str) -> bool:
 
 def _start_background_probe(players: list) -> None:
     """Probe players for qualifying data in a background thread."""
-    batch = players[:1000]
+    batch = players[:5000]
 
     def run():
         global _players_with_data_cache, _cache_ready
@@ -786,7 +788,7 @@ def index():
 
     elif USE_API_ADAPTER:
         try:
-            players = fetch_players(limit=1000)
+            players = fetch_players(limit=5000)
             batters = build_player_dict(players)
             if batters:
                 if not _cache_ready and not _players_with_data_cache:
@@ -810,7 +812,7 @@ def api_batters():
             pass
     elif USE_API_ADAPTER:
         try:
-            batters = build_player_dict(fetch_players(limit=1000))
+            batters = build_player_dict(fetch_players(limit=5000))
             if batters:
                 return jsonify({"ok": True, "batters": batters})
         except Exception:
@@ -822,7 +824,7 @@ def api_batters():
 def api_cache_status():
     """Return background probe progress for the frontend to poll."""
     try:
-        players = fetch_players(limit=1000)
+        players = fetch_players(limit=5000)
     except Exception:
         return jsonify({"ready": False, "batters": {}, "probed": 0, "total": 0})
 
