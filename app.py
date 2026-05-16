@@ -155,12 +155,15 @@ log.info("=" * 60)
 # ═════════════════════════════════════════════════════════
 
 def normalize_hand(raw: str) -> str:
-    """Normalize batting/pitching handedness to single letter."""
+    """Normalize batting/pitching handedness to single letter.
+    L = Left, R = Right, S = Switch, U = Unknown/missing."""
     raw = str(raw).strip().upper()
     if raw in ("LEFT", "L"):
         return "L"
     if raw in ("RIGHT", "R"):
         return "R"
+    if raw in ("SWITCH", "S"):
+        return "S"
     return "U"
 
 
@@ -775,6 +778,29 @@ def _start_background_probe(players: list) -> None:
 #  ROUTES
 # ═════════════════════════════════════════════════════════
 
+def _filter_by_qualifying_cache(players: list) -> list:
+    """
+    Drop players the probe has confirmed as having <MIN_QUALIFYING_BALLS
+    vs either pitcher hand.
+
+    While the probe is still running (cache not ready), unprobed players
+    pass through so the dropdown is populated immediately and narrows
+    progressively. Once the probe finishes, only confirmed-qualifying
+    players remain.
+    """
+    if _cache_ready:
+        # Probe done — strict filter: must be explicitly True in cache
+        return [
+            p for p in players
+            if _players_with_data_cache.get(p.get("player_id")) is True
+        ]
+    # Probe still running — let unprobed players through for now
+    return [
+        p for p in players
+        if _players_with_data_cache.get(p.get("player_id"), True)
+    ]
+
+
 @app.route("/")
 def index():
     """Render the main page with the player dropdown."""
@@ -789,11 +815,13 @@ def index():
     elif USE_API_ADAPTER:
         try:
             players = fetch_players(limit=5000)
-            batters = build_player_dict(players)
-            if batters:
+            if players:
                 if not _cache_ready and not _players_with_data_cache:
                     _start_background_probe(players)
-                return render_template("index.html", batters=batters)
+                # Filter out players known to have <15 balls
+                batters = build_player_dict(_filter_by_qualifying_cache(players))
+                if batters:
+                    return render_template("index.html", batters=batters)
         except Exception:
             log.exception("API player fetch failed")
 
@@ -812,9 +840,14 @@ def api_batters():
             pass
     elif USE_API_ADAPTER:
         try:
-            batters = build_player_dict(fetch_players(limit=5000))
-            if batters:
-                return jsonify({"ok": True, "batters": batters})
+            players = fetch_players(limit=5000)
+            if players:
+                # Kick off the probe on first call if not yet started
+                if not _cache_ready and not _players_with_data_cache:
+                    _start_background_probe(players)
+                batters = build_player_dict(_filter_by_qualifying_cache(players))
+                if batters:
+                    return jsonify({"ok": True, "batters": batters})
         except Exception:
             pass
     return jsonify({"ok": True, "batters": BATTERS})

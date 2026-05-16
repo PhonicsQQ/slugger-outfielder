@@ -366,6 +366,7 @@ def fetch_players(team_name: Optional[str] = None,
 
     allPlayers: List[Dict] = []
     page = 1
+    MAX_PAGE_ATTEMPTS = 3
 
     while len(allPlayers) < limit:
         params = dict(baseParams)
@@ -376,22 +377,37 @@ def fetch_players(team_name: Optional[str] = None,
             f"fetch_players: page={page} collected={len(allPlayers)}"
         )
 
-        data = _get_with_retry(url, params, max_retries=2)
+        # Retry the whole page a few times if it fails — don't bail the
+        # entire fetch on one transient error.
+        data = None
+        for attempt in range(MAX_PAGE_ATTEMPTS):
+            data = _get_with_retry(url, params, max_retries=2)
+            if data and data.get("success"):
+                break
+            log.warning(
+                f"fetch_players page={page} attempt={attempt + 1} failed, retrying"
+            )
+            time.sleep(1.0 * (attempt + 1))
 
         if not data or not data.get("success"):
-            log.error(f"fetch_players failed on page {page}: {data}")
+            log.error(
+                f"fetch_players: giving up on page {page} after "
+                f"{MAX_PAGE_ATTEMPTS} attempts — total so far: {len(allPlayers)}"
+            )
             break
 
         pageRows = data.get("data", [])
         log.info(f"Page {page} returned {len(pageRows)} players")
 
         if not pageRows:
+            log.info(f"No more data after page {page - 1}")
             break
 
         allPlayers.extend(pageRows)
 
         # Last page reached
         if len(pageRows) < PAGE_SIZE:
+            log.info(f"Last page reached — total collected: {len(allPlayers)}")
             break
 
         page += 1
@@ -427,42 +443,48 @@ def fetch_batted_balls(player_ids: Optional[List[str]] = None,
 
 def probe_player_has_data(player_id: str) -> bool:
     """
-    Check if a player has enough qualifying outfield balls in play.
+    Check if a player has enough qualifying outfield balls in play
+    against BOTH pitcher hands.
 
-    Uses the same filter logic as _is_outfield_ball() which mirrors
-    parse_spray_to_dataframe. Fetches up to 500 records per player to
-    reduce false negatives from sparse data.
+    A player only passes if they have >= MIN_QUALIFYING_BALLS against
+    RHP AND >= MIN_QUALIFYING_BALLS against LHP. This matches how the
+    compute endpoint loads data (per-pitcher-hand), so a player who
+    passes the probe is guaranteed to have enough data for either
+    selection in the UI.
 
-    Returns:
-        True if at least MIN_QUALIFYING_BALLS outfield-qualifying records found.
+    Fails closed: if the API errors out, returns False so the player
+    is dropped from the dropdown rather than shown and then erroring
+    on click.
     """
     url = f"{BASE_URL}/pitches"
     PROBE_LIMIT = 500
 
-    params = {
-        "batter_id": player_id,
-        "limit": PROBE_LIMIT,
-        "pitch_call": "InPlay",
-    }
+    for hand in ("Right", "Left"):
+        params = {
+            "batter_id": player_id,
+            "limit": PROBE_LIMIT,
+            "pitch_call": "InPlay",
+            "pitcher_throws": hand,
+        }
 
-    data = _get_with_retry(url, params, max_retries=1)
+        data = _get_with_retry(url, params, max_retries=1)
 
-    if not data or not data.get("success"):
-        log.debug(f"probe: API failed for {player_id} — assuming has data")
-        return True
+        if not data or not data.get("success"):
+            log.debug(f"probe: API failed for {player_id} vs {hand} — failing closed")
+            return False
 
-    records = data.get("data", [])
+        records = data.get("data", [])
+        qualifying_count = sum(1 for p in records if _is_outfield_ball(p))
 
-    qualifying_count = sum(1 for p in records if _is_outfield_ball(p))
+        if qualifying_count < MIN_QUALIFYING_BALLS:
+            log.debug(
+                f"probe: {player_id} vs {hand} — "
+                f"{qualifying_count}/{MIN_QUALIFYING_BALLS} (FAIL)"
+            )
+            return False
 
-    if qualifying_count >= MIN_QUALIFYING_BALLS:
         log.debug(
-            f"probe: {player_id} — {qualifying_count} outfield balls (PASS)"
+            f"probe: {player_id} vs {hand} — {qualifying_count} (PASS)"
         )
-        return True
 
-    log.debug(
-        f"probe: {player_id} — {qualifying_count}/{MIN_QUALIFYING_BALLS} "
-        f"outfield balls (FAIL, checked {len(records)} records)"
-    )
-    return False
+    return True
