@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://1ywv9dczq5.execute-api.us-east-2.amazonaws.com/ALPBAPI"
 API_KEY = os.getenv("API_KEY")
-DATA_DIR = Path(__file__).parent.parent / "data" / "spray"
+DATA_DIR = Path(__file__).parent / "data" / "spray"
 
 if not API_KEY:
     log.warning("API_KEY not found in .env file. API calls will fail.")
