@@ -1,0 +1,8 @@
+.venv-verify
+.venv
+venv
+.git
+__pycache__
+*.pyc
+*.log
+optimized_positions.csv

@@ -187,6 +187,11 @@
   <script type="text/babel">
     const { useState, useEffect } = React;
 
+    // Base path the app is mounted under (e.g. "/widgets/outfielder" behind the
+    // shared ALB, or "" when served at the host root). Injected by Flask so the
+    // API calls hit this widget instead of the platform's own /api/* routes.
+    const API_BASE = "{{ url_prefix }}";
+
     function App() {
       const [batters, setBatters] = useState({});
       const [selectedBatter, setSelectedBatter] = useState("");
@@ -207,7 +212,7 @@
 
       // Load batters on mount
       useEffect(() => {
-        fetch("/api/batters")
+        fetch(API_BASE + "/api/batters")
           .then((r) => r.json())
           .then((data) => {
             if (data.ok && data.batters) {
@@ -229,7 +234,7 @@
         let attempts = 0;
 
         const poll = () => {
-          fetch("/api/cache-status")
+          fetch(API_BASE + "/api/cache-status")
             .then((r) => r.json())
             .then((data) => {
               if (data.batters && Object.keys(data.batters).length > 0) {
@@ -265,7 +270,7 @@
 
         const batter = batters[selectedBatter] || {};
 
-        fetch("/api/compute", {
+        fetch(API_BASE + "/api/compute", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -306,7 +311,7 @@
         setPdfLoading(true);
 
         // Build URL with properly encoded query params
-        let url = `/api/pdf/${encodeURIComponent(computedBatterId)}`;
+        let url = `${API_BASE}/api/pdf/${encodeURIComponent(computedBatterId)}`;
         const params = [];
         if (computedBatterName) params.push(`batter_name=${encodeURIComponent(computedBatterName)}`);
         if (computedBatterHand) params.push(`batter_hand=${encodeURIComponent(computedBatterHand)}`);

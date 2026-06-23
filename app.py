@@ -44,6 +44,45 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ═════════════════════════════════════════════════════════
+#  SUB-PATH MOUNTING (behind the shared ALB)
+# ═════════════════════════════════════════════════════════
+# When hosted at e.g. https://www.alpb-analytics.com/widgets/outfielder/, the
+# load balancer forwards the full path. Strip the prefix so the existing routes
+# ("/", "/api/...") match unchanged. Defaults to "" → no-op for local dev and
+# the legacy PythonAnywhere host. The frontend reads the same value (injected as
+# `url_prefix`) to prefix its fetch() calls.
+URL_PREFIX = os.getenv("URL_PREFIX", "").rstrip("/")
+
+
+class _PrefixMiddleware:
+    def __init__(self, wsgi_app, prefix):
+        self.wsgi_app = wsgi_app
+        self.prefix = prefix
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        if path.startswith(self.prefix):
+            environ["PATH_INFO"] = path[len(self.prefix):] or "/"
+            environ["SCRIPT_NAME"] = self.prefix
+        return self.wsgi_app(environ, start_response)
+
+
+if URL_PREFIX:
+    app.wsgi_app = _PrefixMiddleware(app.wsgi_app, URL_PREFIX)
+
+
+@app.context_processor
+def _inject_url_prefix():
+    return {"url_prefix": URL_PREFIX}
+
+
+@app.route("/healthz")
+def healthz():
+    """Lightweight liveness probe for the load balancer."""
+    return {"status": "ok"}, 200
+
+
+# ═════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═════════════════════════════════════════════════════════
 
