@@ -1,0 +1,62 @@
+{
+  "containerDefinitions": [
+    {
+      "name": "slugger-outfielder",
+      "image": "746669223415.dkr.ecr.us-east-2.amazonaws.com/widget-outfielder:latest",
+      "cpu": 0,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "hostPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {
+          "name": "PORT",
+          "value": "8080"
+        },
+        {
+          "name": "URL_PREFIX",
+          "value": "/widgets/outfielder"
+        },
+        {
+          "name": "USE_API_MODE",
+          "value": "true"
+        }
+      ],
+      "mountPoints": [],
+      "volumesFrom": [],
+      "secrets": [
+        {
+          "name": "API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-2:746669223415:parameter/slugger/outfielder/alpb-api-key"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/slugger-outfielder",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "systemControls": []
+    }
+  ],
+  "family": "slugger-outfielder",
+  "executionRoleArn": "arn:aws:iam::746669223415:role/slugger-ecs-execution",
+  "networkMode": "awsvpc",
+  "volumes": [],
+  "placementConstraints": [],
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "512",
+  "memory": "1024"
+}
