@@ -1,0 +1,85 @@
+name: Outfielder Deploy
+
+# Builds the widget-outfielder container (amd64, Flask/gunicorn) and deploys it to the
+# slugger-outfielder ECS Fargate service behind the shared slugger-alb at /widgets/outfielder/*.
+# Auth is via GitHub OIDC — no static AWS keys. This repo lives outside the slugger-analytics
+# org, so the deploy-role ARN is set directly below (an ARN is not a secret; access is gated
+# by the role's OIDC trust policy, which allow-lists repo:PhonicsQQ/slugger-outfielder).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**'
+      - '!**.md'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: widget-outfielder
+  ECS_SERVICE: slugger-outfielder-service
+  ECS_CLUSTER: slugger-cluster
+  CONTAINER_NAME: slugger-outfielder
+  TASK_DEF: aws/task-definition.json
+  DEPLOY_ROLE_ARN: arn:aws:iam::746669223415:role/github-actions-deploy
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          role-session-name: outfielder-cicd
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push image (amd64)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker buildx build --platform linux/amd64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --provenance=false --push .
+
+      - name: Render task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.TASK_DEF }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Smoke test
+        run: |
+          # Gate on HTTP status, not curl's exit code.
+          URL="https://www.alpb-analytics.com/widgets/outfielder/"
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL") || true
+            case "$code" in
+              200|301|302|308) echo "Smoke OK ($code) on attempt $i"; exit 0 ;;
+            esac
+            echo "attempt $i: HTTP $code — retrying in 15s"; sleep 15
+          done
+          echo "Smoke FAILED after 10 attempts"; exit 1
