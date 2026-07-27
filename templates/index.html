@@ -194,6 +194,7 @@
 
     function App() {
       const [batters, setBatters] = useState({});
+      const [selectedTeam, setSelectedTeam] = useState("All Teams");
       const [selectedBatter, setSelectedBatter] = useState("");
       const [pitcherHand, setPitcherHand] = useState("RHP");
       const [imageBase64, setImageBase64] = useState(null);
@@ -255,11 +256,52 @@
         return () => clearInterval(interval);
       }, []);
 
+      // Team an entry belongs to. Fallback / hardcoded batters carry no
+      // team_name, so they group under "Other".
+      const teamOf = (id) => {
+        const t = batters[id] && batters[id].team_name;
+        return t ? t : "Other";
+      };
+
       const sortedBatterIds = Object.keys(batters).sort((a, b) => {
         const la = (batters[a].label || "").toLowerCase();
         const lb = (batters[b].label || "").toLowerCase();
         return la.localeCompare(lb);
       });
+
+      // "All Teams" first, then the distinct team names alphabetically.
+      const teamOptions = ["All Teams"].concat(
+        Array.from(new Set(sortedBatterIds.map(teamOf))).sort((a, b) =>
+          a.localeCompare(b)
+        )
+      );
+
+      const filteredBatterIds =
+        selectedTeam === "All Teams"
+          ? sortedBatterIds
+          : sortedBatterIds.filter((id) => teamOf(id) === selectedTeam);
+
+      // The 5s poll swaps in a fresh batter list; if the chosen team is no
+      // longer represented, fall back to "All Teams".
+      useEffect(() => {
+        if (selectedTeam === "All Teams") return;
+        const teams = new Set(Object.keys(batters).map(teamOf));
+        if (!teams.has(selectedTeam)) {
+          setSelectedTeam("All Teams");
+        }
+      }, [batters]);
+
+      // Keep the batter selection valid: if the current pick is filtered out
+      // (team change or list refresh), auto-select the first in the filtered
+      // list — mirrors the initial auto-select-first behavior.
+      useEffect(() => {
+        if (
+          filteredBatterIds.length > 0 &&
+          !filteredBatterIds.includes(selectedBatter)
+        ) {
+          setSelectedBatter(filteredBatterIds[0]);
+        }
+      }, [selectedTeam, batters, selectedBatter]);
 
       const handleGenerate = () => {
         if (!selectedBatter) return;
@@ -368,6 +410,21 @@
             </div>
 
             <div className="field-group">
+              <label className="field-label">Team</label>
+              <select
+                className="field-select"
+                value={selectedTeam}
+                onChange={(e) => setSelectedTeam(e.target.value)}
+              >
+                {teamOptions.map((team) => (
+                  <option key={team} value={team}>
+                    {team}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="field-group">
               <label className="field-label">Batter</label>
               {loadingBatters ? (
                 <p className="status-line">Loading players…</p>
@@ -377,7 +434,7 @@
                   value={selectedBatter}
                   onChange={(e) => setSelectedBatter(e.target.value)}
                 >
-                  {sortedBatterIds.map((id) => (
+                  {filteredBatterIds.map((id) => (
                     <option key={id} value={id}>
                       {batters[id].label}
                     </option>

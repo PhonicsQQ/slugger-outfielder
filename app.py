@@ -276,6 +276,7 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
                 "pid": pid,
                 "name": name,
                 "hand": hand,
+                "team": team,
                 "dropped": [],
             }
             order.append(gkey)
@@ -302,6 +303,7 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
             "batter_name": name,
             "batter_hand": hand,
             "player_id": pid,
+            "team_name": group["team"],
         }
     return result
 
