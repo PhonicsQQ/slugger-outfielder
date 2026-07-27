@@ -218,13 +218,47 @@ def is_valid_player_name(name: str) -> bool:
     return True
 
 
+def _uppercase_count(name: str) -> int:
+    """Count uppercase letters — used to prefer a properly-cased label over
+    an all-lowercase duplicate of the same name."""
+    return sum(1 for c in name if c.isupper())
+
+
+def _merge_hand(existing: str, incoming: str) -> str:
+    """Merge two normalized handedness codes for the same player.
+
+    Prefer a populated value over 'U' (unknown/missing), and prefer 'S'
+    (switch) over a one-sided 'L'/'R' when both are populated.
+    """
+    if existing == incoming:
+        return existing
+    if existing == "U":
+        return incoming
+    if incoming == "U":
+        return existing
+    if "S" in (existing, incoming):
+        return "S"
+    # Two differing one-sided values (L vs R) for the same name are unexpected;
+    # keep the first-seen value for stability.
+    return existing
+
+
 def build_player_dict(players: list) -> Dict[str, Dict]:
     """
-    Convert a list of player records into the batter dict format
-    used by the frontend.  Deduplicates by (name, hand).
+    Convert a list of player records into the batter dict format used by the
+    frontend.
+
+    Records are grouped by (casefolded name, casefolded team) so case-variant
+    duplicates of the same human on the same team collapse into a single entry
+    (e.g. "flores, santiago" + "Flores, Santiago"). Players who merely share a
+    name on *different* teams stay separate. Within a group the properly-cased
+    variant wins the label, handedness merges (populated beats missing, switch
+    beats a one-sided L/R), and the first data-bearing player_id is kept as the
+    stable id — the probe filter has already dropped non-qualifying pids
+    upstream.
     """
-    result = {}
-    seen = set()
+    groups: Dict[Tuple[str, str], Dict] = {}
+    order: List[Tuple[str, str]] = []
     for p in players:
         pid = p.get("player_id")
         if not pid:
@@ -233,10 +267,36 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
         if not is_valid_player_name(name):
             continue
         hand = normalize_hand(p.get("player_batting_handedness") or "")
-        key_pair = (name, hand)
-        if key_pair in seen:
+        team = (p.get("team_name") or "").strip()
+        gkey = (name.casefold(), team.casefold())
+
+        group = groups.get(gkey)
+        if group is None:
+            groups[gkey] = {
+                "pid": pid,
+                "name": name,
+                "hand": hand,
+                "dropped": [],
+            }
+            order.append(gkey)
             continue
-        seen.add(key_pair)
+
+        # Duplicate of an already-seen human on the same team — merge in place.
+        group["dropped"].append(str(pid))
+        if _uppercase_count(name) > _uppercase_count(group["name"]):
+            group["name"] = name
+        group["hand"] = _merge_hand(group["hand"], hand)
+
+    result: Dict[str, Dict] = {}
+    for gkey in order:
+        group = groups[gkey]
+        name, hand, pid = group["name"], group["hand"], group["pid"]
+        if group["dropped"]:
+            log.info(
+                "Merged duplicate player record(s) for %s (%s): kept pid %s, "
+                "dropped %s",
+                name, hand, pid, ", ".join(group["dropped"]),
+            )
         result[str(pid)] = {
             "label": f"{name} ({hand})",
             "batter_name": name,
