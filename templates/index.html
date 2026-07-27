@@ -157,6 +157,7 @@
       max-width: 100%;
       max-height: calc(100vh - 120px);
       border-radius: 4px;
+      cursor: zoom-in;
     }
 
     .empty-state {
@@ -179,6 +180,63 @@
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
+
+    /* Tap-to-enlarge lightbox for the result image */
+    .lightbox-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 2000;
+      background: rgba(0, 0, 0, 0.9);
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+      cursor: zoom-out;
+    }
+
+    .lightbox-image {
+      display: block;
+      width: 200%;
+      max-width: none;
+    }
+
+    .lightbox-close {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 2001;
+      width: 40px;
+      height: 40px;
+      font-size: 24px;
+      line-height: 1;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      border-radius: 50%;
+      cursor: pointer;
+    }
+
+    /* Mobile: stack the sidebar above the chart and let both use full width */
+    @media (max-width: 768px) {
+      .app {
+        flex-direction: column;
+      }
+      .sidebar {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid #e5e5e5;
+        padding: 16px;
+      }
+      .spray-image {
+        max-height: none;
+        width: 100%;
+      }
+      /* Inline the PDF button so it no longer covers the chart */
+      .btn-pdf {
+        position: static;
+        display: inline-block;
+        margin: 16px;
+        box-shadow: none;
+      }
+    }
   </style>
 </head>
 <body>
@@ -200,6 +258,7 @@
       const [imageBase64, setImageBase64] = useState(null);
       const [batterLabel, setBatterLabel] = useState("");
       const [loading, setLoading] = useState(false);
+      const [zoomed, setZoomed] = useState(false);
       const [loadingBatters, setLoadingBatters] = useState(true);
       const [error, setError] = useState(null);
       const [playerCount, setPlayerCount] = useState(0);
@@ -308,6 +367,7 @@
         setLoading(true);
         setError(null);
         setImageBase64(null);
+        setZoomed(false);
         setPdfReady(false);
 
         const batter = batters[selectedBatter] || {};
@@ -471,6 +531,7 @@
                   className="spray-image"
                   src={`data:image/png;base64,${imageBase64}`}
                   alt="Spray chart"
+                  onClick={() => setZoomed(true)}
                 />
               </div>
             ) : (
@@ -489,6 +550,27 @@
             >
               {pdfLoading ? "⏳ Generating PDF…" : "📄 Print PDF"}
             </button>
+          )}
+
+          {/* Tap-to-enlarge lightbox — tap the overlay or the X to close */}
+          {zoomed && imageBase64 && (
+            <div className="lightbox-overlay" onClick={() => setZoomed(false)}>
+              <button
+                className="lightbox-close"
+                aria-label="Close"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setZoomed(false);
+                }}
+              >
+                ×
+              </button>
+              <img
+                className="lightbox-image"
+                src={`data:image/png;base64,${imageBase64}`}
+                alt="Spray chart enlarged"
+              />
+            </div>
           )}
         </div>
       );
