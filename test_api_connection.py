@@ -5,8 +5,12 @@ import requests
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY")
-print(f"API Key: {API_KEY}")
-print(f"API Key length: {len(API_KEY)}")
+if API_KEY:
+    # Never print the raw key — show only a masked fingerprint for sanity-checking.
+    masked = f"{API_KEY[:4]}...{API_KEY[-2:]}" if len(API_KEY) > 6 else "***"
+    print(f"API Key: {masked} (length {len(API_KEY)})")
+else:
+    print("API Key: <not set> — set API_KEY in your environment or .env")
 
 # Match Postman headers exactly
 headers = {
