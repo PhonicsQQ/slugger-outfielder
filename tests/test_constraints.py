@@ -200,6 +200,33 @@ def test_invariants_over_grid():
                 assert np.isfinite(clamped[n][0]) and np.isfinite(clamped[n][1])
             # disjoint windows guarantee structural left→right ordering
             assert out["LF"][0] <= out["CF"][0] + 1e-6 <= out["RF"][0] + 2e-6
+            # the promised minimum separation must hold for BOTH adjacent pairs
+            assert out["CF"][0] - out["LF"][0] >= app.OF_MIN_SEPARATION_DEG - 1e-6
+            assert out["RF"][0] - out["CF"][0] >= app.OF_MIN_SEPARATION_DEG - 1e-6
+
+
+# ── 9b. cross-pair separation regressions (second pair must not undo first) ─
+
+def _final_angles(raw_angles, depth=300.0):
+    raw = {n: app.angle_dist_to_pixel(a, depth) for n, a in raw_angles.items()}
+    clamped, _ = app.compute_constrained_positions(raw)
+    return {n: app.pixel_to_angle_dist(*p)[0] for n, p in clamped.items()}
+
+
+def test_separation_second_pair_does_not_undo_first():
+    # Raw LF/CF gap is exactly satisfied (19°); enforcing (CF,RF) must not
+    # drag CF back below LF + 18.
+    out = _final_angles({"LF": -14.0, "CF": 5.0, "RF": 14.0})
+    assert out["CF"] - out["LF"] >= app.OF_MIN_SEPARATION_DEG - 1e-6
+    assert out["RF"] - out["CF"] >= app.OF_MIN_SEPARATION_DEG - 1e-6
+
+
+def test_separation_holds_when_rf_window_clamps_first():
+    # RF at -38 clamps to its window floor (+14) before separation runs; the
+    # (CF,RF) push must resolve entirely on RF's side of CF's floor.
+    out = _final_angles({"LF": -14.0, "CF": 4.0, "RF": -38.0})
+    assert out["CF"] - out["LF"] >= app.OF_MIN_SEPARATION_DEG - 1e-6
+    assert out["RF"] - out["CF"] >= app.OF_MIN_SEPARATION_DEG - 1e-6
 
 
 # ── 10. raw centroid extraction is behaviour-identical ─────────────────────

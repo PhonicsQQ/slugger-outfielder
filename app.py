@@ -514,15 +514,24 @@ def compute_raw_positions(balls_pixel: list) -> Dict[str, Tuple[float, float]]:
     return optimized_pixel
 
 
-def _enforce_separation(left: str, right: str, angles: Dict[str, float]) -> None:
+def _enforce_separation(
+    left: str,
+    right: str,
+    angles: Dict[str, float],
+    left_floor: float | None = None,
+) -> None:
     """Push an adjacent (left, right) pair to ≥ OF_MIN_SEPARATION_DEG apart.
 
     Symmetric push of need/2 each, re-clipped to each window; any residual left
-    by a window edge is pushed onto whichever side is not pinned. With the
-    default disjoint windows a full fix is always reachable — the log.warning is
-    a safety net for a mis-tuned config.
+    by a window edge is pushed onto whichever side is not pinned. ``left_floor``
+    tightens the left element's lower bound so enforcing this pair can never
+    re-violate an already-satisfied pair to its left. With the default disjoint
+    windows a full fix is always reachable — the log.warning is a safety net
+    for a mis-tuned config.
     """
     llo, lhi = _angle_window(left)
+    if left_floor is not None:
+        llo = max(llo, left_floor)
     rlo, rhi = _angle_window(right)
     la, ra = angles[left], angles[right]
     gap = ra - la
@@ -584,11 +593,16 @@ def compute_constrained_positions(
         dlo, dhi = OF_DEPTH_BOUNDS[name]
         dists[name] = min(max(d, dlo), dhi)
 
-    # Separation over adjacent present pairs, left to right.
-    order = ["LF", "CF", "RF"]
-    for left, right in zip(order, order[1:]):
-        if left in angles and right in angles:
-            _enforce_separation(left, right, angles)
+    # Separation over adjacent present pairs, left to right. The second pair
+    # gets a floor at LF's final angle + the minimum separation so pushing CF
+    # left for RF's sake can never undo the already-satisfied (LF, CF) pair.
+    if "LF" in angles and "CF" in angles:
+        _enforce_separation("LF", "CF", angles)
+    if "CF" in angles and "RF" in angles:
+        floor = (
+            angles["LF"] + OF_MIN_SEPARATION_DEG if "LF" in angles else None
+        )
+        _enforce_separation("CF", "RF", angles, left_floor=floor)
 
     # Back-convert and build the adjustment report.
     clamped: Dict[str, Tuple[float, float]] = dict(passthrough)
