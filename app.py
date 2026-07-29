@@ -1449,16 +1449,91 @@ def api_optimize_and_visualize(player_id: str):
 #  PDF SCOUTING REPORT
 # ═════════════════════════════════════════════════════════
 
+def _draw_player_report_page(c, page_w, page_h, batter_id,
+                             client_name=None, client_hand=None,
+                             img_format="png"):
+    """Draw one player's vs-RHP/vs-LHP report onto canvas ``c``.
+
+    Renders the vs RHP (top) and vs LHP (bottom) spray charts stacked on the
+    current page. Does NOT call ``c.showPage()`` or ``c.save()`` so callers can
+    append this page to a multi-page document (the client-side team merge builds
+    a document one player-page at a time).
+
+    ``img_format`` is "png" (default, embedded losslessly) or "jpeg" (re-encoded
+    at quality 85 to shrink multi-page team reports).
+
+    Returns ``(drawn, rhp_label_or_err, lhp_label_or_err)``. When neither hand
+    has data, ``drawn`` is False and nothing is drawn.
+    """
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image as PILImage
+
+    rhp_img, rhp_label = load_spray_and_render(
+        batter_id, "RHP", client_name, client_hand)
+    lhp_img, lhp_label = load_spray_and_render(
+        batter_id, "LHP", client_name, client_hand)
+
+    if rhp_img is None and lhp_img is None:
+        return False, rhp_label, lhp_label
+
+    player_name = rhp_label or lhp_label or "Unknown Player"
+    margin = 24
+
+    # Title
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString(page_w / 2, page_h - 32,
+                        f"SLUGGER Scouting Report — {player_name}")
+
+    # Chart layout
+    header_bottom = page_h - 46
+    gap = 8
+    chart_w = page_w - 2 * margin
+    chart_h = (header_bottom - margin - gap) / 2
+
+    def draw_chart(img_b64, y_bottom, label):
+        if img_b64 is None:
+            c.setFont("Helvetica", 12)
+            c.setFillColorRGB(0.5, 0.5, 0.5)
+            c.drawCentredString(page_w / 2, y_bottom + chart_h / 2,
+                                f"No data available ({label})")
+            c.setFillColorRGB(0, 0, 0)
+            return
+        img_bytes = base64.b64decode(img_b64)
+        pil = PILImage.open(io.BytesIO(img_bytes))
+        if img_format == "jpeg":
+            rgb = pil.convert("RGB") if pil.mode != "RGB" else pil
+            jbuf = io.BytesIO()
+            rgb.save(jbuf, format="JPEG", quality=85)
+            jbuf.seek(0)
+            reader = ImageReader(jbuf)
+        else:
+            reader = ImageReader(io.BytesIO(img_bytes))
+        scale = min(chart_w / pil.width, chart_h / pil.height)
+        dw, dh = pil.width * scale, pil.height * scale
+        c.drawImage(reader,
+                    margin + (chart_w - dw) / 2,
+                    y_bottom + (chart_h - dh) / 2,
+                    width=dw, height=dh)
+
+    top_y = header_bottom - chart_h
+    draw_chart(rhp_img, top_y, "vs RHP")
+    draw_chart(lhp_img, top_y - gap - chart_h, "vs LHP")
+
+    return True, rhp_label, lhp_label
+
+
 @app.route("/api/pdf/<batter_id>", methods=["GET"])
 def api_pdf(batter_id: str):
     """
-    Generate a portrait 8.5×11 PDF with vs RHP (top) and
+    Generate a portrait 8.5x11 PDF with vs RHP (top) and
     vs LHP (bottom) spray charts stacked vertically.
+
+    ``?img=jpeg`` re-encodes the embedded charts to shrink the file (used by the
+    client-side team-report merge); any other value falls back to PNG.
     """
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas as rl_canvas
-        from reportlab.lib.utils import ImageReader
     except ImportError:
         return jsonify({
             "ok": False,
@@ -1466,65 +1541,30 @@ def api_pdf(batter_id: str):
         }), 500
 
     try:
-        from PIL import Image as PILImage
-
         client_name = request.args.get("batter_name")
         client_hand = request.args.get("batter_hand")
+        img_format = request.args.get("img", "png").lower()
+        if img_format not in ("png", "jpeg"):
+            img_format = "png"
 
-        rhp_img, rhp_label = load_spray_and_render(
-            batter_id, "RHP", client_name, client_hand)
-        lhp_img, lhp_label = load_spray_and_render(
-            batter_id, "LHP", client_name, client_hand)
+        page_w, page_h = letter  # 612 x 792 pt
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=letter)
 
-        if rhp_img is None and lhp_img is None:
+        drawn, rhp_label, lhp_label = _draw_player_report_page(
+            c, page_w, page_h, batter_id,
+            client_name, client_hand, img_format)
+
+        if not drawn:
             return jsonify({
                 "ok": False,
                 "error": f"No data. RHP: {rhp_label}. LHP: {lhp_label}"
             }), 404
 
-        page_w, page_h = letter  # 612 × 792 pt
-        buf = io.BytesIO()
-        c = rl_canvas.Canvas(buf, pagesize=letter)
-
-        player_name = rhp_label or lhp_label or "Unknown Player"
-        margin = 24
-
-        # Title
-        c.setFont("Helvetica-Bold", 18)
-        c.drawCentredString(page_w / 2, page_h - 32,
-                            f"SLUGGER Scouting Report \u2014 {player_name}")
-
-        # Chart layout
-        header_bottom = page_h - 46
-        gap = 8
-        chart_w = page_w - 2 * margin
-        chart_h = (header_bottom - margin - gap) / 2
-
-        def draw_chart(img_b64, y_bottom, label):
-            if img_b64 is None:
-                c.setFont("Helvetica", 12)
-                c.setFillColorRGB(0.5, 0.5, 0.5)
-                c.drawCentredString(page_w / 2, y_bottom + chart_h / 2,
-                                    f"No data available ({label})")
-                c.setFillColorRGB(0, 0, 0)
-                return
-            img_bytes = base64.b64decode(img_b64)
-            pil = PILImage.open(io.BytesIO(img_bytes))
-            scale = min(chart_w / pil.width, chart_h / pil.height)
-            dw, dh = pil.width * scale, pil.height * scale
-            c.drawImage(
-                ImageReader(io.BytesIO(img_bytes)),
-                margin + (chart_w - dw) / 2,
-                y_bottom + (chart_h - dh) / 2,
-                width=dw, height=dh)
-
-        top_y = header_bottom - chart_h
-        draw_chart(rhp_img, top_y, "vs RHP")
-        draw_chart(lhp_img, top_y - gap - chart_h, "vs LHP")
-
         c.save()
         buf.seek(0)
 
+        player_name = rhp_label or lhp_label or "Unknown Player"
         safe = re.sub(r"[^a-zA-Z0-9_]", "_", player_name.split("(")[0].strip())
         return send_file(buf, mimetype="application/pdf",
                          as_attachment=True,

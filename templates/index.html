@@ -7,6 +7,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
   <style>
     * {
       margin: 0;
@@ -96,10 +97,18 @@
       cursor: not-allowed;
     }
 
-    .btn-pdf {
+    /* Fixed dock holding the per-player + team PDF buttons. */
+    .pdf-buttons {
       position: fixed;
       bottom: 24px;
       left: 24px;
+      display: flex;
+      gap: 8px;
+      z-index: 1000;
+    }
+
+    .btn-pdf {
+      position: static;
       padding: 10px 20px;
       font-size: 14px;
       font-weight: 600;
@@ -109,7 +118,6 @@
       border-radius: 6px;
       cursor: pointer;
       box-shadow: 0 2px 8px rgba(0,0,0,0.25);
-      z-index: 1000;
       transition: background 0.15s, opacity 0.15s;
     }
 
@@ -120,6 +128,15 @@
     .btn-pdf:disabled {
       opacity: 0.5;
       cursor: not-allowed;
+    }
+
+    .pdf-note {
+      position: fixed;
+      bottom: 64px;
+      left: 24px;
+      font-size: 11px;
+      color: #555;
+      z-index: 1000;
     }
 
     .status-line {
@@ -229,12 +246,17 @@
         max-height: none;
         width: 100%;
       }
-      /* Inline the PDF button so it no longer covers the chart */
-      .btn-pdf {
+      /* Inline the PDF buttons so they no longer cover the chart */
+      .pdf-buttons {
         position: static;
-        display: inline-block;
         margin: 16px;
+      }
+      .btn-pdf {
         box-shadow: none;
+      }
+      .pdf-note {
+        position: static;
+        margin: 0 16px 16px;
       }
     }
   </style>
@@ -269,6 +291,11 @@
       const [computedBatterId, setComputedBatterId] = useState(null);
       const [computedBatterName, setComputedBatterName] = useState("");
       const [computedBatterHand, setComputedBatterHand] = useState("");
+
+      // Team PDF (client-side merge) state
+      const [teamPdfLoading, setTeamPdfLoading] = useState(false);
+      const [teamPdfProgress, setTeamPdfProgress] = useState({ done: 0, total: 0 });
+      const [teamPdfNote, setTeamPdfNote] = useState("");
 
       // Load batters on mount
       useEffect(() => {
@@ -452,6 +479,86 @@
           });
       };
 
+      // One-click team report: fetch each roster player's single-page PDF and
+      // merge them client-side with pdf-lib. Sequential (single gunicorn
+      // worker) and JPEG-encoded pages to keep the download small.
+      const handleTeamPdf = async () => {
+        if (selectedTeam === "All Teams" || teamPdfLoading) return;
+        if (typeof PDFLib === "undefined") {
+          alert(
+            "Team PDF needs the pdf-lib library, which failed to load. " +
+              "Use the per-player Print PDF button instead."
+          );
+          return;
+        }
+
+        // Snapshot roster + team at click time so a background poll refresh
+        // can't change what we merge mid-run.
+        const roster = filteredBatterIds.slice();
+        const teamName = selectedTeam;
+        if (roster.length === 0) {
+          alert("No players for this team.");
+          return;
+        }
+
+        setTeamPdfLoading(true);
+        setTeamPdfNote("");
+        setTeamPdfProgress({ done: 0, total: roster.length });
+
+        try {
+          const merged = await PDFLib.PDFDocument.create();
+          let pages = 0;
+          let skipped = 0;
+
+          for (let i = 0; i < roster.length; i++) {
+            const id = roster[i];
+            const batter = batters[id] || {};
+            let url = `${API_BASE}/api/pdf/${encodeURIComponent(id)}?img=jpeg`;
+            if (batter.batter_name)
+              url += `&batter_name=${encodeURIComponent(batter.batter_name)}`;
+            if (batter.batter_hand)
+              url += `&batter_hand=${encodeURIComponent(batter.batter_hand)}`;
+
+            try {
+              const resp = await fetch(url);
+              if (!resp.ok) {
+                skipped++;
+              } else {
+                const bytes = await resp.arrayBuffer();
+                const doc = await PDFLib.PDFDocument.load(bytes);
+                const copied = await merged.copyPages(doc, doc.getPageIndices());
+                copied.forEach((p) => merged.addPage(p));
+                pages++;
+              }
+            } catch (err) {
+              skipped++;
+            }
+            setTeamPdfProgress({ done: i + 1, total: roster.length });
+          }
+
+          if (pages === 0) {
+            alert("No player reports could be generated for this team.");
+          } else {
+            const out = await merged.save();
+            const blob = new Blob([out], { type: "application/pdf" });
+            const href = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = href;
+            const safeTeam = teamName.replace(/\s+/g, "_");
+            a.download = `SLUGGER_${safeTeam}_team_report.pdf`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(href);
+            setTeamPdfNote(`${pages} pages, ${skipped} skipped (insufficient data)`);
+          }
+        } catch (err) {
+          alert("Team PDF failed: " + err.message);
+        } finally {
+          setTeamPdfLoading(false);
+        }
+      };
+
       return (
         <div className="app">
           <div className="sidebar">
@@ -541,16 +648,33 @@
             )}
           </div>
 
-          {/* Print PDF button — fixed bottom-left, appears after a chart is generated */}
-          {pdfReady && (
+          {/* Fixed bottom-left dock: per-player PDF (after a chart) + team PDF */}
+          {teamPdfNote && <div className="pdf-note">{teamPdfNote}</div>}
+          <div className="pdf-buttons">
+            {pdfReady && (
+              <button
+                className="btn-pdf"
+                onClick={handlePdfDownload}
+                disabled={pdfLoading || teamPdfLoading}
+              >
+                {pdfLoading ? "⏳ Generating PDF…" : "📄 Print PDF"}
+              </button>
+            )}
             <button
               className="btn-pdf"
-              onClick={handlePdfDownload}
-              disabled={pdfLoading}
+              onClick={handleTeamPdf}
+              disabled={selectedTeam === "All Teams" || pdfLoading || teamPdfLoading}
+              title={
+                selectedTeam === "All Teams"
+                  ? "Pick a team to export its full roster"
+                  : "Download a combined PDF for every player on this team"
+              }
             >
-              {pdfLoading ? "⏳ Generating PDF…" : "📄 Print PDF"}
+              {teamPdfLoading
+                ? `Team PDF ${teamPdfProgress.done}/${teamPdfProgress.total}…`
+                : "📄 Team PDF"}
             </button>
-          )}
+          </div>
 
           {/* Tap-to-enlarge lightbox — tap the overlay or the X to close */}
           {zoomed && imageBase64 && (

@@ -1,3 +1,4 @@
 # Dev/test-only dependencies (not installed into the production image).
 # Runtime deps live in requirements.txt.
 pytest
+pypdf
