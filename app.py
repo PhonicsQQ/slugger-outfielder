@@ -137,6 +137,67 @@ DEPTH_WEIGHT_CONFIG = {
     "deep_weight":      4.0,   # ← bump this to push fielders deeper
 }
 
+# ── Coach-standard alignment constraints ─────────────────
+# The depth-weighted centroid can drop a fielder somewhere a coach would
+# never stand: pulled hard off the alignment line, buried too shallow/deep,
+# or stacked on top of a neighbour. Coaches align outfielders around three
+# anchors — LF ≈ −27°, CF ≈ 0°, RF ≈ +27° — and read a placement as "crazy"
+# when it sits more than ±13° from its anchor, is closer than 18° to a
+# neighbour, or falls outside a sane depth band. We sanity-clamp each raw
+# placement back into these windows before it is drawn.
+#
+# Note the anchor±13 windows (e.g. LF −40..−14) run past the ±38 pixel
+# mapping range, so each window is *intersected* with (dir_min, dir_max):
+# LF collapses to −38..−14, CF to −13..13, RF to 14..38 — three disjoint
+# bands. Disjointness is what makes left→right ordering structural rather
+# than something the separation pass has to defend.
+OF_CONSTRAINTS_ENABLED = os.getenv("OF_CONSTRAINTS_ENABLED", "true").lower() == "true"
+OF_ANGLE_ANCHORS = {"LF": -27.0, "CF": 0.0, "RF": 27.0}
+OF_MAX_ANGLE_DEVIATION = 13.0
+OF_DEPTH_BOUNDS = {"LF": (240.0, 325.0), "CF": (260.0, 345.0), "RF": (240.0, 325.0)}
+OF_MIN_SEPARATION_DEG = 18.0
+OF_CLAMP_NOTE_MIN_DELTA = (0.5, 5.0)   # (deg, ft) — deltas above this count as "engaged"
+DEPTH_POSITION_PERCENTILE = 30  # moved from make_plot_with_image local (line 648)
+
+
+def _angle_window(name: str) -> Tuple[float, float]:
+    """Anchor ±deviation intersected with the (dir_min, dir_max) mapping range."""
+    anchor = OF_ANGLE_ANCHORS[name]
+    cfg = SPRAY_PIXEL_CONFIG
+    lo = max(anchor - OF_MAX_ANGLE_DEVIATION, cfg["dir_min"])
+    hi = min(anchor + OF_MAX_ANGLE_DEVIATION, cfg["dir_max"])
+    return (lo, hi)
+
+
+def _validate_of_constraints() -> None:
+    """Fail fast at import if the constraint config is internally inconsistent."""
+    cfg = SPRAY_PIXEL_CONFIG
+    order = ["LF", "CF", "RF"]
+    anchors = [OF_ANGLE_ANCHORS[n] for n in order]
+    if not (anchors[0] < anchors[1] < anchors[2]):
+        raise ValueError(f"OF_ANGLE_ANCHORS must strictly increase LF<CF<RF: {anchors}")
+
+    windows = {n: _angle_window(n) for n in order}
+    for n in order:
+        lo, hi = windows[n]
+        if lo >= hi:
+            raise ValueError(f"angle window for {n} empty after intersection: {(lo, hi)}")
+    # Adjacent windows must stay disjoint so ordering is structural.
+    for a, b in zip(order, order[1:]):
+        if windows[a][1] >= windows[b][0]:
+            raise ValueError(
+                f"angle windows {a} {windows[a]} and {b} {windows[b]} overlap")
+
+    dmin, dmax = cfg["dist_min"], cfg["dist_max"]
+    for n in order:
+        lo, hi = OF_DEPTH_BOUNDS[n]
+        if not (dmin <= lo < hi <= dmax):
+            raise ValueError(
+                f"OF_DEPTH_BOUNDS[{n}]={(lo, hi)} must sit inside ({dmin}, {dmax})")
+
+
+_validate_of_constraints()
+
 
 # ═════════════════════════════════════════════════════════
 #  DATA SOURCE DETECTION
@@ -368,6 +429,181 @@ def _get_depth_weight(distance: float) -> float:
     elif distance > cfg["deep_cutoff"]:
         return cfg["deep_weight"]
     return cfg["medium_weight"]
+
+
+# ═════════════════════════════════════════════════════════
+#  OUTFIELD PLACEMENT CONSTRAINTS
+# ═════════════════════════════════════════════════════════
+
+def pixel_to_angle_dist(px: float, py: float) -> Tuple[float, float]:
+    """Exact inverse of the forward (angle, dist) → pixel mapping.
+
+    Mirrors lines 609-628: distance from vertical band position, then angle
+    from horizontal position between the two pole lines *recomputed at this py*.
+    """
+    cfg = SPRAY_PIXEL_CONFIG
+    top, bottom = cfg["outfield_top_px"], cfg["outfield_bottom_px"]
+    dist = cfg["dist_min"] + (bottom - py) / (bottom - top) * (cfg["dist_max"] - cfg["dist_min"])
+
+    x_left = (cfg["home_x_px"]
+              + (py - cfg["home_y_px"])
+              * (cfg["lf_pole_x_px"] - cfg["home_x_px"])
+              / (cfg["lf_pole_y_px"] - cfg["home_y_px"]))
+    x_right = (cfg["home_x_px"]
+               + (py - cfg["home_y_px"])
+               * (cfg["rf_pole_x_px"] - cfg["home_x_px"])
+               / (cfg["rf_pole_y_px"] - cfg["home_y_px"]))
+
+    angle = cfg["dir_min"] + (px - x_left) / (x_right - x_left) * (cfg["dir_max"] - cfg["dir_min"])
+    return angle, dist
+
+
+def angle_dist_to_pixel(angle: float, dist: float) -> Tuple[float, float]:
+    """Forward (angle, dist) → pixel mapping in float (no int(), no clip).
+
+    Mirrors lines 609-628 exactly except for the rounding/clipping the display
+    path applies. ``x_left``/``x_right`` are recomputed at the new ``pixel_y`` by
+    construction, so it is the true inverse of ``pixel_to_angle_dist``.
+    """
+    cfg = SPRAY_PIXEL_CONFIG
+    top, bottom = cfg["outfield_top_px"], cfg["outfield_bottom_px"]
+    depth_frac = (dist - cfg["dist_min"]) / (cfg["dist_max"] - cfg["dist_min"])
+    pixel_y = bottom - depth_frac * (bottom - top)
+
+    dir_frac = (angle - cfg["dir_min"]) / (cfg["dir_max"] - cfg["dir_min"])
+    x_left = (cfg["home_x_px"]
+              + (pixel_y - cfg["home_y_px"])
+              * (cfg["lf_pole_x_px"] - cfg["home_x_px"])
+              / (cfg["lf_pole_y_px"] - cfg["home_y_px"]))
+    x_right = (cfg["home_x_px"]
+               + (pixel_y - cfg["home_y_px"])
+               * (cfg["rf_pole_x_px"] - cfg["home_x_px"])
+               / (cfg["rf_pole_y_px"] - cfg["home_y_px"]))
+    pixel_x = x_left + dir_frac * (x_right - x_left)
+    return pixel_x, pixel_y
+
+
+def compute_raw_positions(balls_pixel: list) -> Dict[str, Tuple[float, float]]:
+    """Depth-weighted lateral centroid + depth-percentile Y per LF/CF/RF third.
+
+    Behaviour-identical extraction of the former inline block (lines 650-671).
+    ``balls_pixel`` entries are (pixel_x, pixel_y, color, distance_ft).
+    """
+    optimized_pixel: Dict[str, Tuple[float, float]] = {}
+    if balls_pixel:
+        sorted_dots = sorted(balls_pixel, key=lambda d: d[0])
+        third = max(1, len(sorted_dots) // 3)
+        for name, dots in [("LF", sorted_dots[:third]),
+                           ("CF", sorted_dots[third:2 * third]),
+                           ("RF", sorted_dots[2 * third:])]:
+            if dots:
+                # Weighted centroid for lateral position
+                total_w = 0.0
+                wx_sum = 0.0
+                for (px, py, _, dist) in dots:
+                    w = _get_depth_weight(dist)
+                    wx_sum += w * px
+                    total_w += w
+                avg_x = wx_sum / total_w
+
+                # Percentile for depth — lower pixel_y = deeper
+                ys = [py for (_, py, _, _) in dots]
+                depth_y = float(np.percentile(ys, DEPTH_POSITION_PERCENTILE))
+
+                optimized_pixel[name] = (avg_x, depth_y)
+    return optimized_pixel
+
+
+def _enforce_separation(left: str, right: str, angles: Dict[str, float]) -> None:
+    """Push an adjacent (left, right) pair to ≥ OF_MIN_SEPARATION_DEG apart.
+
+    Symmetric push of need/2 each, re-clipped to each window; any residual left
+    by a window edge is pushed onto whichever side is not pinned. With the
+    default disjoint windows a full fix is always reachable — the log.warning is
+    a safety net for a mis-tuned config.
+    """
+    llo, lhi = _angle_window(left)
+    rlo, rhi = _angle_window(right)
+    la, ra = angles[left], angles[right]
+    gap = ra - la
+    if gap >= OF_MIN_SEPARATION_DEG:
+        return
+
+    need = OF_MIN_SEPARATION_DEG - gap
+    half = need / 2.0
+    la2 = min(max(la - half, llo), lhi)
+    ra2 = min(max(ra + half, rlo), rhi)
+
+    if ra2 - la2 < OF_MIN_SEPARATION_DEG:
+        residual = OF_MIN_SEPARATION_DEG - (ra2 - la2)
+        eps = 1e-9
+        left_pinned = la2 <= llo + eps
+        right_pinned = ra2 >= rhi - eps
+        if not right_pinned:
+            ra2 = min(max(ra2 + residual, rlo), rhi)
+        elif not left_pinned:
+            la2 = min(max(la2 - residual, llo), lhi)
+        if (ra2 - la2) < OF_MIN_SEPARATION_DEG - 1e-6:
+            log.warning(
+                "OF separation %s/%s could not reach %.1f° (windows too tight): "
+                "gap=%.2f°", left, right, OF_MIN_SEPARATION_DEG, ra2 - la2)
+
+    angles[left], angles[right] = la2, ra2
+
+
+def compute_constrained_positions(
+    raw_positions: Dict[str, Tuple[float, float]],
+) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, Dict]]:
+    """Sanity-clamp raw fielder placements into coach alignment windows.
+
+    Returns (clamped_positions, report) where report[name] carries the signed
+    angle/distance deltas and an ``engaged`` flag (moved beyond the note
+    thresholds). When disabled or given no fielders, the input is returned
+    unchanged with an empty report.
+    """
+    if not OF_CONSTRAINTS_ENABLED or not raw_positions:
+        return raw_positions, {}
+
+    angle_th, dist_th = OF_CLAMP_NOTE_MIN_DELTA
+
+    # Polar-convert the known fielders; unknown keys pass through untouched.
+    raw_polar: Dict[str, Tuple[float, float]] = {}
+    passthrough: Dict[str, Tuple[float, float]] = {}
+    for name, (px, py) in raw_positions.items():
+        if name in OF_ANGLE_ANCHORS:
+            raw_polar[name] = pixel_to_angle_dist(px, py)
+        else:
+            passthrough[name] = (px, py)
+
+    # Per-fielder clamp: angle into its window, distance into its depth band.
+    angles: Dict[str, float] = {}
+    dists: Dict[str, float] = {}
+    for name, (a, d) in raw_polar.items():
+        lo, hi = _angle_window(name)
+        angles[name] = min(max(a, lo), hi)
+        dlo, dhi = OF_DEPTH_BOUNDS[name]
+        dists[name] = min(max(d, dlo), dhi)
+
+    # Separation over adjacent present pairs, left to right.
+    order = ["LF", "CF", "RF"]
+    for left, right in zip(order, order[1:]):
+        if left in angles and right in angles:
+            _enforce_separation(left, right, angles)
+
+    # Back-convert and build the adjustment report.
+    clamped: Dict[str, Tuple[float, float]] = dict(passthrough)
+    report: Dict[str, Dict] = {}
+    for name, (a0, d0) in raw_polar.items():
+        a1, d1 = angles[name], dists[name]
+        clamped[name] = angle_dist_to_pixel(a1, d1)
+        d_angle = a1 - a0
+        d_dist = d1 - d0
+        engaged = abs(d_angle) > angle_th or abs(d_dist) > dist_th
+        report[name] = {"engaged": engaged, "d_angle": d_angle, "d_dist": d_dist}
+        if engaged:
+            log.info("OF constraint engaged for %s: Δangle=%.1f° Δdist=%.1fft",
+                     name, d_angle, d_dist)
+    return clamped, report
 
 
 # ═════════════════════════════════════════════════════════
@@ -636,39 +872,13 @@ def make_plot_with_image(
         balls_pixel.append((pixel_x, pixel_y, color, dist_f))
 
     # ── Fielder positioning: weighted X + depth percentile Y ──
-    # Lateral (X): depth-weighted centroid (same as before).
-    # Depth (Y):   place fielder at the 35th percentile of ball
-    #              pixel_y in the zone — meaning 65% of balls are
-    #              shallower (higher pixel_y) and 35% are deeper.
-    #              Lower percentile = closer to fence.
-    #              Adjust DEPTH_POSITION_PERCENTILE to taste:
-    #                20 = very aggressive (near fence)
-    #                35 = moderately deep (default)
-    #                50 = plain median
-    DEPTH_POSITION_PERCENTILE = 30
-
-    optimized_pixel = {}
-    if balls_pixel:
-        sorted_dots = sorted(balls_pixel, key=lambda d: d[0])
-        third = max(1, len(sorted_dots) // 3)
-        for name, dots in [("LF", sorted_dots[:third]),
-                           ("CF", sorted_dots[third:2*third]),
-                           ("RF", sorted_dots[2*third:])]:
-            if dots:
-                # Weighted centroid for lateral position
-                total_w = 0.0
-                wx_sum = 0.0
-                for (px, py, _, dist) in dots:
-                    w = _get_depth_weight(dist)
-                    wx_sum += w * px
-                    total_w += w
-                avg_x = wx_sum / total_w
-
-                # Percentile for depth — lower pixel_y = deeper
-                ys = [py for (_, py, _, _) in dots]
-                depth_y = float(np.percentile(ys, DEPTH_POSITION_PERCENTILE))
-
-                optimized_pixel[name] = (avg_x, depth_y)
+    # Lateral (X): depth-weighted centroid. Depth (Y): the
+    # DEPTH_POSITION_PERCENTILE-th percentile of ball pixel_y in the zone
+    # (lower pixel_y = closer to the fence). The raw centroid is then sanity-
+    # clamped into coach alignment windows before anything is drawn, so the
+    # outcome recolour below scores dots against the *displayed* fielders.
+    optimized_pixel = compute_raw_positions(balls_pixel)
+    optimized_pixel, clamp_report = compute_constrained_positions(optimized_pixel)
 
     # ── Depth-aware outcome reassignment ─────────────────
     # Shallow balls (< shallow_cutoff) are capped at SINGLE.
@@ -720,6 +930,12 @@ def make_plot_with_image(
                                facecolor="yellow", alpha=0.7, zorder=7))
         ax.scatter(px, py, c="red", s=60, edgecolor="white",
                    linewidth=0.8, zorder=8)
+
+    # Footnote when any fielder was nudged onto a standard alignment.
+    if any(r.get("engaged") for r in clamp_report.values()):
+        ax.text(img_w - 24, img_h - 20,
+                "* fielder positions adjusted to standard alignment",
+                fontsize=7, color="#555555", ha="right", va="bottom", zorder=9)
 
     # Legend
     ax.legend(handles=[
