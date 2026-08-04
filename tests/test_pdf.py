@@ -140,3 +140,76 @@ def test_draw_player_report_page_single_page(monkeypatch):
     buf.seek(0)
     reader = PdfReader(io.BytesIO(buf.getvalue()))
     assert len(reader.pages) == 1
+
+
+# ── 7. a pooled batter draws one page from every member's spray ────────────
+
+def test_pooled_batter_page_resolves_the_whole_union(monkeypatch):
+    """Two roster records proven to be one hitter mean two upstream fetches per
+    pitcher hand — four for the page — but still exactly one page, and the
+    disclosure travels into the PDF for free because the same PNG is embedded.
+    """
+    fetched = []
+
+    def _fake_fetch(player_id, pitcher_hand=None, start_date=None,
+                    end_date=None, limit=5000):
+        fetched.append((player_id, pitcher_hand))
+        return [{"date": "2025-05-0%d" % len(fetched), "exit_speed": 90.0}]
+
+    rendered = []
+
+    def _fake_plot(df, positions=None, batter_label="", pitcher_hand="RHP",
+                   background_image_path=None, sample_note=""):
+        rendered.append(sample_note)
+        return _png_b64()
+
+    monkeypatch.setattr(app, "fetch_player_spray", _fake_fetch)
+    monkeypatch.setattr(app, "make_plot_with_image", _fake_plot)
+    monkeypatch.setattr(app, "_union_ids", {"a": ["a", "b"], "b": ["a", "b"]})
+    monkeypatch.setattr(
+        app, "_sample_notes",
+        {"a": "sample pooled from 2 roster records",
+         "b": "sample pooled from 2 roster records"})
+    monkeypatch.setattr(app, "USE_API_ADAPTER", True)
+    monkeypatch.setattr(app, "USE_JSON_LOADER", False)
+    monkeypatch.setattr(app, "MIN_QUALIFYING_BALLS", 1)
+    monkeypatch.setattr(app, "resolve_batter_meta",
+                        lambda *a, **k: {"label": "De Aza, Alejandro (S)"})
+
+    # load_spray_and_render imports the parser from data_loader at call time.
+    import data_loader
+    monkeypatch.setattr(
+        data_loader, "parse_spray_to_dataframe",
+        lambda rows: __import__("pandas").DataFrame({
+            "x": [1.0] * len(rows), "y": [2.0] * len(rows),
+            "hang_time": [None] * len(rows), "outcome": [None] * len(rows),
+        }))
+
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas as rl_canvas
+    from pypdf import PdfReader
+
+    page_w, page_h = letter
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=letter)
+    drawn, _, _ = app._draw_player_report_page(c, page_w, page_h, "a")
+    c.save()
+
+    assert drawn is True
+    assert [pid for pid, _ in fetched] == ["a", "b", "a", "b"]
+    assert rendered == ["sample pooled from 2 roster records"] * 2
+    reader = PdfReader(io.BytesIO(buf.getvalue()))
+    assert len(reader.pages) == 1
+
+
+# ── 8. pooling must not rename a user-visible artifact ─────────────────────
+
+def test_pdf_download_name_unchanged_for_merged_entry(client, monkeypatch):
+    # The filename derives from the label resolve_batter_meta rebuilds, which
+    # never carries the team qualifier — so a pooled entry downloads under the
+    # same name a coach saw before the merge shipped.
+    monkeypatch.setattr(app, "load_spray_and_render", _stub_render(_png_b64()))
+    resp = client.get("/api/pdf/somebatter")
+    assert resp.status_code == 200
+    assert "SLUGGER_Test_Player_report.pdf" in \
+        resp.headers.get("Content-Disposition", "")

@@ -227,7 +227,7 @@ MIN_QUALIFYING_BALLS = 15
 try:
     from adapter import (
         fetch_ballparks, fetch_games, fetch_player_spray,
-        fetch_players, MIN_QUALIFYING_BALLS,
+        fetch_players, probe_player_identity, MIN_QUALIFYING_BALLS,
     )
     USE_API_ADAPTER = True
 except ImportError:
@@ -311,22 +311,127 @@ def _team_qualifier(team: str) -> str:
     return f" — {team}" if team else " — no team listed"
 
 
-def build_player_dict(players: list) -> Dict[str, Dict]:
+# Two records only corroborate each other on a pitcher hand where both carry
+# enough measured swings to be one-sided. The constants sit on a measured
+# plateau rather than a cliff: min_n 5 or 10 × purity 0.90 or 0.95 all merge
+# the same 74 name groups; refusal only starts at min_n 20 (71) and 25 (61).
+_SIDE_MIN_BALLS = 10
+_SIDE_PURITY = 0.90
+
+
+def _merge_refusal(fa: Optional[Dict], fb: Optional[Dict]) -> Optional[str]:
+    """Why two same-name records must NOT be pooled, or None to pool them.
+
+    Merging is refused by default and allowed only on positive proof, because
+    the two failure modes are not symmetric: leaving one traded hitter split
+    shows a coach half a spray chart, while splicing two different men produces
+    a confident alignment where neither of them hits the ball — undetectable on
+    the sheet. Clauses run most-damning first so the reported reason is the one
+    that actually settles it.
+    """
+    if not fa or not fb:
+        return "missing evidence"
+    if fa.get("truncated") or fb.get("truncated") or fa.get("error") or fb.get("error"):
+        return "truncated evidence"
+    # One human cannot appear twice inside one game_id. Measured: this is the
+    # tripwire with a proven positive (McCarthy, Ryan — 7 shared games on one
+    # pair, 5 on another).
+    if fa["games"] & fb["games"]:
+        return "shared game"
+    # …nor suit up for two clubs on one calendar day. Same-day-same-club is an
+    # ingest artifact (the 2024-07-05 Hagerstown game arrived under two
+    # game_ids with byte-identical Trackman), so the club test is required —
+    # but it has to be a *positive* match. team_code is None whenever a record
+    # spans more than one club, which is exactly what a feed that stopped
+    # minting one id per stint would produce, so an unknown club reads as
+    # "cannot tell" and the shared day still refuses.
+    same_club = bool(fa.get("team_code")) and fa.get("team_code") == fb.get("team_code")
+    if not same_club and (fa["days"] & fb["days"]):
+        return "same day, two clubs"
+
+    # Measured batting side, per platoon hand so a genuine switch hitter is not
+    # split. Roster handedness is never consulted: it is contradicted by the
+    # data on the very records at issue, and an "S" tag does not mean left.
+    decided = 0
+    for hand in ("R", "L"):
+        side_a, purity_a, n_a = fa["sides"].get(hand, (None, 0.0, 0))
+        side_b, purity_b, n_b = fb["sides"].get(hand, (None, 0.0, 0))
+        if (n_a < _SIDE_MIN_BALLS or n_b < _SIDE_MIN_BALLS
+                or purity_a < _SIDE_PURITY or purity_b < _SIDE_PURITY):
+            continue
+        if side_a != side_b:
+            return "batting side conflict"
+        decided += 1
+    if not decided:
+        # 52 of the merged pairs never overlap in time, so the collision tests
+        # have no power on them and side agreement is the only thing standing
+        # between one traded man and two different men.
+        return "no corroborating side evidence"
+    return None
+
+
+def _last_tracked_day(group: Dict) -> str:
+    """Latest date this roster record has a tracked pitch on, "" when unknown.
+
+    Dates arrive ISO-formatted, so a plain string max orders them. Used to pick
+    which of a pooled hitter's records names his current club.
+    """
+    fp = group.get("fp")
+    days = fp.get("days") if fp else None
+    return max(days) if days else ""
+
+
+def _sample_note(members: List[Dict], refused: List[Dict]) -> str:
+    """One-line disclosure telling a coach whether the sheet is whole.
+
+    ``members`` are the roster records pooled into this entry and ``refused``
+    the same-name records the evidence would not let us pool in; both carry the
+    ``name``/``team``/``balls`` keys build_player_dict assembles. A pooled entry
+    says how many records it stands on, a partial one says how much tracked
+    evidence is sitting under the record it could not join, and a whole entry
+    says nothing.
+    """
+    if len(members) > 1:
+        return f"sample pooled from {len(members)} roster records"
+    if not refused:
+        return ""
+    extra = sum(m.get("balls", 0) for m in refused)
+    if not extra:
+        return ""
+    teams = ", ".join(m["team"] or "no team listed" for m in refused)
+    article = "a separate" if len(refused) == 1 else "separate"
+    noun = "record" if len(refused) == 1 else "records"
+    return (f"partial sample — {extra} more tracked balls under {article} "
+            f"{members[0]['name']} {noun} ({teams})")
+
+
+def build_player_dict(players: list,
+                      identities: Optional[Dict[str, Dict]] = None) -> Dict[str, Dict]:
     """
     Convert a list of player records into the batter dict format used by the
     frontend.
 
     Records are grouped by (casefolded name, casefolded team) so case-variant
     duplicates of the same human on the same team collapse into a single entry
-    (e.g. "flores, santiago" + "Flores, Santiago"). Players who merely share a
-    name on *different* teams stay separate. Within a group the properly-cased
-    variant wins the label, handedness merges (populated beats missing, switch
-    beats a one-sided L/R), and the first data-bearing player_id is kept as the
-    stable id — the probe filter has already dropped non-qualifying pids
-    upstream. Records that share a name across teams — including a record the
-    feed left without a team — are separate stints with their own spray history
-    and are not merged; their labels carry the team so the dropdown can tell
-    them apart.
+    (e.g. "flores, santiago" + "Flores, Santiago"). Within a group the properly-
+    cased variant wins the label, handedness merges (populated beats missing,
+    switch beats a one-sided L/R), and the first data-bearing player_id is kept
+    as the stable id — the probe filter has already dropped non-qualifying pids
+    upstream.
+
+    Records sharing a casefolded name across *teams* — including a record the
+    feed left without a team — are one hitter's stints only when the pitch-feed
+    fingerprints in ``identities`` (keyed by player_id, see
+    adapter.probe_player_identity) prove it: no shared game, no shared day under
+    two clubs, and measured batting side that agrees and actually decides. One
+    refusal anywhere inside a name group refuses the whole group, because a name
+    proven to cover two humans can no longer treat "these two never collided" as
+    evidence of one. ``identities=None`` therefore reproduces the pre-merge
+    output exactly — refusal is the literal default when no evidence exists.
+
+    Every entry carries ``merged_ids`` (ordered, primary first, always non-empty)
+    so the render path can pool the union, and ``sample_note``, which is empty
+    only when the entry is whole.
     """
     groups: Dict[Tuple[str, str], Dict] = {}
     order: List[Tuple[str, str]] = []
@@ -359,22 +464,93 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
             group["name"] = name
         group["hand"] = _merge_hand(group["hand"], hand)
 
-    result: Dict[str, Dict] = {}
-    # Same-name records on different teams are separate stints with their own
-    # spray history, so they stay separate entries and the label carries the
-    # team to tell them apart.
-    name_groups: Dict[str, int] = {}
-    for gkey in order:
-        name_groups[gkey[0]] = name_groups.get(gkey[0], 0) + 1
+    # ── Cross-team merge pass ────────────────────────────────────────────
+    # Attach each group's fingerprint and its qualifying-ball count, then ask
+    # _merge_refusal about every pair inside a casefolded-name bucket. A bucket
+    # collapses to one entity only when every pair clears; one refusal keeps the
+    # whole bucket split (see the docstring), so grouping is order-independent.
+    fingerprints = identities or {}
     for gkey in order:
         group = groups[gkey]
-        name, hand, pid = group["name"], group["hand"], group["pid"]
+        fp = fingerprints.get(str(group["pid"]))
+        group["fp"] = fp
+        group["balls"] = sum(fp["balls"].values()) if fp else 0
+
+    buckets: Dict[str, List[Tuple[str, str]]] = {}
+    for gkey in order:
+        buckets.setdefault(gkey[0], []).append(gkey)
+
+    merged_bucket: Dict[str, bool] = {}
+    for cname, bucket in buckets.items():
+        members = [groups[k] for k in bucket]
+        refusal = None
+        for i, a in enumerate(members):
+            for b in members[i + 1:]:
+                refusal = _merge_refusal(a["fp"], b["fp"])
+                if refusal:
+                    break
+            if refusal:
+                break
+        merged_bucket[cname] = len(members) > 1 and refusal is None
+        if len(members) > 1 and refusal:
+            log.info("Kept %d records for %s separate: %s",
+                     len(members), members[0]["name"], refusal)
+
+    # Primary pid = the team-bearing member seen most recently in the pitch
+    # feed, so a merged entity leaves the "no team listed" bucket *and* is filed
+    # under the club the hitter actually plays for. Roster order says nothing
+    # about which stint is current, and a pooled name loses its team qualifier,
+    # so a stale primary would drop the hitter out of his own team's dropdown
+    # filter and team PDF with nothing on the label to show it. max() keeps the
+    # first-seen record on a tie.
+    primaries: Dict[str, Tuple[str, str]] = {}
+    for cname, bucket in buckets.items():
+        rostered = [k for k in bucket if groups[k]["team"]]
+        primaries[cname] = (max(rostered, key=lambda k: _last_tracked_day(groups[k]))
+                            if rostered else bucket[0])
+
+    entries: List[Tuple[Tuple[str, str], Dict, List[Dict], List[Dict]]] = []
+    for gkey in order:
+        cname = gkey[0]
+        bucket = buckets[cname]
+        members = [groups[k] for k in bucket]
+        if merged_bucket[cname]:
+            # One entity, emitted at the primary record's position in the list.
+            if gkey != primaries[cname]:
+                continue
+            primary = groups[primaries[cname]]
+            pooled = [primary] + [m for m in members if m is not primary]
+            entries.append((gkey, primary, pooled, []))
+        else:
+            group = groups[gkey]
+            entries.append(
+                (gkey, group, [group], [m for m in members if m is not group]))
+
+    result: Dict[str, Dict] = {}
+    # Recomputed after merging, so a name that collapsed to one entity loses the
+    # now-redundant team suffix and only genuinely ambiguous names keep it.
+    name_groups: Dict[str, int] = {}
+    for gkey, _, _, _ in entries:
+        name_groups[gkey[0]] = name_groups.get(gkey[0], 0) + 1
+    for gkey, group, pooled, refused in entries:
+        name, pid = group["name"], group["pid"]
+        hand = group["hand"]
+        # Same preference as the same-team merge: properly-cased label wins,
+        # populated handedness beats missing, switch beats a one-sided L/R.
+        for m in pooled[1:]:
+            if _uppercase_count(m["name"]) > _uppercase_count(name):
+                name = m["name"]
+            hand = _merge_hand(hand, m["hand"])
         if group["dropped"]:
             log.info(
                 "Merged duplicate player record(s) for %s (%s): kept pid %s, "
                 "dropped %s",
                 name, hand, pid, ", ".join(group["dropped"]),
             )
+        merged_ids = [str(m["pid"]) for m in pooled]
+        if len(merged_ids) > 1:
+            log.info("Pooled %s (%s) from %d roster records: %s",
+                     name, hand, len(merged_ids), ", ".join(merged_ids))
         label = f"{name} ({hand})"
         if name_groups[gkey[0]] > 1:
             label += _team_qualifier(group["team"])
@@ -384,6 +560,8 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
             "batter_hand": hand,
             "player_id": pid,
             "team_name": group["team"],
+            "merged_ids": merged_ids,
+            "sample_note": _sample_note(pooled, refused),
         }
     return result
 
@@ -782,8 +960,13 @@ def make_plot(
     positions: Optional[Dict[str, Tuple[float, float]]],
     batter_label: str,
     pitcher_hand: str,
+    sample_note: str = "",
 ) -> str:
-    """Draw a synthetic field and overlay spray data. Returns base64 PNG."""
+    """Draw a synthetic field and overlay spray data. Returns base64 PNG.
+
+    ``sample_note`` is the whole-sample disclosure and is drawn as a footnote —
+    never appended to ``batter_label``, which the batting-side note reads.
+    """
     outcome_col = _find_outcome_col(df)
     spray_colors = df[outcome_col].map(
         lambda v: OUTCOME_COLORS.get(str(v).upper(), "white"))
@@ -842,6 +1025,12 @@ def make_plot(
     ax.set_xlim(40, 260)
     ax.set_ylim(200, 420)
     ax.axis("off")
+
+    # Sample-completeness footnote, bottom-left (light on the drawn grass).
+    if sample_note:
+        ax.text(42, 202, sample_note, fontsize=7, color="#dddddd",
+                ha="left", va="bottom", zorder=9)
+
     ax.set_title(f"{batter_label} vs {pitcher_hand}" +
                  _batting_side_note(df, batter_label),
                  color="white", fontsize=16, pad=12)
@@ -862,10 +1051,15 @@ def make_plot_with_image(
     batter_label: str = "Test Player",
     pitcher_hand: str = "RHP",
     background_image_path: str = DEFAULT_BACKGROUND,
+    sample_note: str = "",
 ) -> str:
     """
     Render spray chart over a real ballpark photo.
     Falls back to make_plot() if image/config unavailable.
+
+    ``sample_note`` states whether the chart stands on this hitter's whole
+    tracked sample; it is drawn as a footnote and is deliberately kept out of
+    ``batter_label``, which _batting_side_note pattern-matches on.
     """
     from PIL import Image
 
@@ -882,7 +1076,7 @@ def make_plot_with_image(
         img_array = np.array(img)
     except Exception as e:
         log.warning("Background image failed (%s) — using drawn field.", e)
-        return make_plot(df, positions, batter_label, pitcher_hand)
+        return make_plot(df, positions, batter_label, pitcher_hand, sample_note)
 
     # Load outfield region manager
     outfield_manager = None
@@ -895,7 +1089,7 @@ def make_plot_with_image(
         log.warning("OutfieldRegionManager load failed: %s", e)
 
     if not outfield_manager:
-        return make_plot(df, positions, batter_label, pitcher_hand)
+        return make_plot(df, positions, batter_label, pitcher_hand, sample_note)
 
     img_h, img_w = img_array.shape[:2]
     cfg = SPRAY_PIXEL_CONFIG
@@ -1015,6 +1209,11 @@ def make_plot_with_image(
                 "* fielder positions adjusted to standard alignment",
                 fontsize=7, color="#555555", ha="right", va="bottom", zorder=9)
 
+    # Mirrored on the left: whether this is the hitter's whole tracked sample.
+    if sample_note:
+        ax.text(24, img_h - 20, sample_note,
+                fontsize=7, color="#555555", ha="left", va="bottom", zorder=9)
+
     # Legend
     ax.legend(handles=[
         Patch(facecolor=OUTCOME_COLORS["OUT"], label="OUT"),
@@ -1040,6 +1239,81 @@ def make_plot_with_image(
 #  DATA LOADING — unified per-pitcher-hand helper
 # ═════════════════════════════════════════════════════════
 
+# Fields that pin one pitch. Used only to drop the same batted ball when it
+# reaches us under two player_ids — the feed re-ingested one 2024-07-05 game
+# under two game_ids, so a pooled chart would otherwise draw those balls twice.
+_SPRAY_SIGNATURE_FIELDS = (
+    "date", "inning", "top_or_bottom", "pa_of_inning", "pitch_of_pa",
+    "pitcher_id", "exit_speed", "angle", "direction", "distance",
+)
+
+
+def _spray_signature(row: Dict) -> Tuple:
+    return tuple(row.get(f) for f in _SPRAY_SIGNATURE_FIELDS)
+
+
+def _fetch_union_spray(batter_id: str,
+                       pitcher_hand: Optional[str] = None,
+                       start_date: Optional[str] = None,
+                       end_date: Optional[str] = None,
+                       limit: int = 1000) -> Tuple[List[Dict], List[str]]:
+    """
+    Fetch spray data for every roster record proven to be this hitter.
+
+    Mirrors fetch_player_spray's signature and degrades to exactly one call for
+    a batter that was never pooled (which is every batter until the identity
+    pass has run), so nothing changes for the 278 unmerged entries.
+
+    Rows from the first id are kept verbatim — including the duplicate rows the
+    feed already carries within a single id, so an unmerged chart never shifts —
+    and each later id contributes only pitches not already drawn.
+
+    Returns ``(rows, contributed_ids)``; an id missing from ``contributed_ids``
+    returned nothing, so the caller can disclose a partial pool rather than
+    quietly showing one again.
+    """
+    ids = _union_ids.get(str(batter_id), [str(batter_id)])
+
+    rows: List[Dict] = []
+    contributed: List[str] = []
+    seen = set()
+
+    for pid in ids:
+        try:
+            part = fetch_player_spray(
+                player_id=pid, pitcher_hand=pitcher_hand,
+                start_date=start_date, end_date=end_date, limit=limit)
+        except Exception:
+            log.exception("Pooled spray fetch failed for %s", pid)
+            continue
+
+        if not part:
+            log.warning("Pooled record %s returned no rows for %s", pid, batter_id)
+            continue
+
+        fresh = [r for r in part if _spray_signature(r) not in seen]
+        seen.update(_spray_signature(r) for r in fresh)
+        rows.extend(fresh)
+        contributed.append(pid)
+
+    if len(ids) > 1:
+        log.info("Pooled spray for %s: %d rows from %d/%d records",
+                 batter_id, len(rows), len(contributed), len(ids))
+    return rows, contributed
+
+
+def _render_sample_note(batter_id: str, contributed: List[str]) -> str:
+    """Disclosure for one rendered chart: what the entry claims, plus whatever
+    the pool actually failed to load on this render."""
+    note = _sample_notes.get(str(batter_id), "")
+    ids = _union_ids.get(str(batter_id), [str(batter_id)])
+    missing = [i for i in ids if i not in contributed]
+    if missing:
+        short = f"{len(missing)} pooled record(s) could not be loaded"
+        note = f"{note} — {short}" if note else f"partial sample — {short}"
+    return note
+
+
 def load_spray_and_render(
     batter_id: str,
     pitcher_hand_label: str,
@@ -1054,12 +1328,15 @@ def load_spray_and_render(
         (base64_png, batter_label)  on success
         (None, error_message)       on failure
     """
+    sample_note = ""
+
     # ── API adapter mode ──
     if USE_API_ADAPTER and not USE_JSON_LOADER:
         pitcher_letter = pitcher_hand_label.replace("HP", "").upper()
-        spray_data = fetch_player_spray(
-            player_id=batter_id, pitcher_hand=pitcher_letter,
+        spray_data, contributed = _fetch_union_spray(
+            batter_id, pitcher_hand=pitcher_letter,
             start_date=None, end_date=None, limit=1000)
+        sample_note = _render_sample_note(batter_id, contributed)
 
         if not spray_data:
             return None, f"No spray data for {pitcher_hand_label}"
@@ -1118,7 +1395,8 @@ def load_spray_and_render(
     img_b64 = make_plot_with_image(
         df, positions=None, batter_label=batter_label,
         pitcher_hand=pitcher_hand_label,
-        background_image_path=background_image_path)
+        background_image_path=background_image_path,
+        sample_note=sample_note)
 
     return img_b64, batter_label
 
@@ -1129,6 +1407,20 @@ def load_spray_and_render(
 
 _players_with_data_cache: dict = {}
 _cache_ready: bool = False
+
+# Pitch-feed fingerprints keyed by player_id, and what the merge concluded from
+# them. _union_ids maps EVERY pid in a pooled group — primary and folded — onto
+# the same ordered id list, so a stale client holding a folded pid still renders
+# the whole hitter instead of half of one. All three are published in one swap
+# at the end of the identity pass and are empty until then, so the dropdown can
+# never conclude a pool the render path cannot yet fetch; every path degrades to
+# its pre-merge behaviour in the meantime.
+_identity_cache: dict = {}
+_union_ids: Dict[str, List[str]] = {}
+_sample_notes: Dict[str, str] = {}
+# False until the identity pass has finished (or failed) — the dropdown is only
+# final once this is set, so the frontend must not stop polling on _cache_ready.
+_merge_ready: bool = False
 
 
 def _probe_one_player(player_id: str) -> bool:
@@ -1166,8 +1458,70 @@ def _start_background_probe(players: list) -> None:
         found = sum(1 for v in _players_with_data_cache.values() if v)
         log.info("Probe complete: %d/%d players confirmed", found, len(batch))
 
+        # Only now, so the dropdown never re-groups mid-warm-up and yanks the
+        # user's selection out from under him.
+        global _merge_ready
+        try:
+            _resolve_identities(batch)
+        except Exception:
+            log.exception("Identity pass failed — records stay separate")
+        finally:
+            # Either way the list is as final as it is going to get, so the
+            # frontend stops polling instead of waiting on a pass that died.
+            _merge_ready = True
+
     threading.Thread(target=run, daemon=True).start()
     log.info("Background probe started for %d players", len(batch))
+
+
+def _resolve_identities(players: list) -> None:
+    """Fingerprint the duplicate-name players so the merge has evidence.
+
+    Scoped to names that survive the qualifying probe on more than one record —
+    measured, 156 of 2072 players — because those are the only records the merge
+    can ever pool, and the scoping is what keeps this at one extra upstream call
+    per candidate instead of one per player. Paced like the probe it follows.
+
+    Fingerprints accumulate in a local dict and reach _identity_cache only once
+    the whole pass has run: the dropdown merges off _identity_cache while the
+    render pools off _union_ids, so publishing a fingerprint early would let the
+    list fold two records into one entry that still charts a single record, with
+    no disclosure and the sibling entry gone — the original half-sample bug with
+    the other half made unreachable. A pass that dies partway therefore leaves
+    every record separate, which is what the caller already reports.
+    """
+    import time
+
+    qualifying = _filter_by_qualifying_cache(players)
+    seen_names: Dict[str, int] = {}
+    for p in qualifying:
+        name = (p.get("player_name") or "").strip().casefold()
+        if name:
+            seen_names[name] = seen_names.get(name, 0) + 1
+
+    targets = [
+        p for p in qualifying
+        if seen_names.get((p.get("player_name") or "").strip().casefold(), 0) > 1
+    ]
+    log.info("Identity pass: fingerprinting %d duplicate-name records",
+             len(targets))
+
+    fingerprints: Dict[str, Dict] = {}
+    for p in targets:
+        pid = p.get("player_id")
+        if not pid:
+            continue
+        time.sleep(0.5)
+        try:
+            fingerprint = probe_player_identity(pid)
+        except Exception:
+            log.exception("Identity probe failed for %s", pid)
+            continue
+        if fingerprint:
+            fingerprints[str(pid)] = fingerprint
+
+    _publish_identities(fingerprints,
+                        build_player_dict(qualifying, identities=fingerprints))
 
 
 # ═════════════════════════════════════════════════════════
@@ -1197,6 +1551,47 @@ def _filter_by_qualifying_cache(players: list) -> list:
     ]
 
 
+def _publish_unions(batters: dict) -> None:
+    """Publish what the merge concluded, for the render path to read.
+
+    Both maps are rebuilt whole and swapped in, so a render either sees the
+    complete previous conclusion or the complete new one, never a half-written
+    pool.
+    """
+    global _union_ids, _sample_notes
+
+    unions: Dict[str, List[str]] = {}
+    notes: Dict[str, str] = {}
+    for pid, entry in batters.items():
+        ids = list(entry.get("merged_ids") or [str(pid)])
+        note = entry.get("sample_note") or ""
+        for member in ids:
+            unions[str(member)] = ids
+            if note:
+                notes[str(member)] = note
+
+    _union_ids, _sample_notes = unions, notes
+    pooled = sum(1 for e in batters.values() if len(e.get("merged_ids") or []) > 1)
+    log.info("Identity pass complete: %d entries, %d pooled from >1 record",
+             len(batters), pooled)
+
+
+def _publish_identities(fingerprints: Dict[str, Dict], batters: dict) -> None:
+    """Hand the finished identity pass to the dropdown and the render path.
+
+    The pools go out first and the fingerprints second, because the two are read
+    by different code: build_player_dict folds records using _identity_cache
+    while _fetch_union_spray pools ids using _union_ids. Publishing the pools
+    first means the only window that exists is the harmless one — an id already
+    resolves to its whole pool before any entry has folded — never the one where
+    the list has folded a record the chart cannot reach.
+    """
+    global _identity_cache
+
+    _publish_unions(batters)
+    _identity_cache = fingerprints
+
+
 @app.route("/")
 def index():
     """Render the main page with the player dropdown."""
@@ -1215,7 +1610,8 @@ def index():
                 if not _cache_ready and not _players_with_data_cache:
                     _start_background_probe(players)
                 # Filter out players known to have <15 balls
-                batters = build_player_dict(_filter_by_qualifying_cache(players))
+                batters = build_player_dict(
+                    _filter_by_qualifying_cache(players), identities=_identity_cache)
                 if batters:
                     return render_template("index.html", batters=batters)
         except Exception:
@@ -1241,7 +1637,8 @@ def api_batters():
                 # Kick off the probe on first call if not yet started
                 if not _cache_ready and not _players_with_data_cache:
                     _start_background_probe(players)
-                batters = build_player_dict(_filter_by_qualifying_cache(players))
+                batters = build_player_dict(
+                    _filter_by_qualifying_cache(players), identities=_identity_cache)
                 if batters:
                     return jsonify({"ok": True, "batters": batters})
         except Exception:
@@ -1261,10 +1658,15 @@ def api_cache_status():
         p for p in players
         if p.get("player_id") and _players_with_data_cache.get(p["player_id"], False)
     ]
-    batters = build_player_dict(confirmed)
+    batters = build_player_dict(confirmed, identities=_identity_cache)
 
     return jsonify({
         "ready": _cache_ready,
+        # The probe finishes before the identity pass, so "ready" alone still
+        # describes a list that is about to fold its duplicate records. A client
+        # that stops polling here keeps both halves of a pooled hitter on screen,
+        # rendering the same union twice under two teams.
+        "merged": _merge_ready,
         "batters": batters,
         "probed": len(_players_with_data_cache),
         "total": len(players),
@@ -1282,12 +1684,15 @@ def api_compute():
         client_name = payload.get("batter_name")
         client_hand = payload.get("batter_hand")
 
+        sample_note = ""
+
         # ── API adapter mode ──
         if USE_API_ADAPTER and not USE_JSON_LOADER:
             pitcher_letter = pitcher_hand.replace("HP", "").upper() if pitcher_hand else "R"
-            spray_data = fetch_player_spray(
-                player_id=batter_id, pitcher_hand=pitcher_letter,
+            spray_data, contributed = _fetch_union_spray(
+                batter_id, pitcher_hand=pitcher_letter,
                 start_date=None, end_date=None, limit=1000)
+            sample_note = _render_sample_note(batter_id, contributed)
 
             if not spray_data:
                 return jsonify({"ok": False, "error": "No spray data available."}), 404
@@ -1357,7 +1762,8 @@ def api_compute():
         # Render
         img_b64 = make_plot_with_image(
             df, positions=None, batter_label=meta["label"],
-            pitcher_hand=pitcher_hand, background_image_path=bg_path)
+            pitcher_hand=pitcher_hand, background_image_path=bg_path,
+            sample_note=sample_note)
 
         return jsonify({
             "ok": True,
@@ -1367,6 +1773,7 @@ def api_compute():
             "pitcher_hand": pitcher_hand,
             "positions": positions_drawn or {},
             "image_base64": img_b64,
+            "sample_note": sample_note,
             "download_url": "/download",
         })
 
@@ -1469,8 +1876,8 @@ def api_optimize_and_visualize(player_id: str):
             end_date = request.args.get("end_date")
             bg_path = request.args.get("background_image_path", DEFAULT_BACKGROUND)
 
-        spray_data = fetch_player_spray(
-            player_id=player_id, pitcher_hand=pitcher_hand,
+        spray_data, contributed = _fetch_union_spray(
+            player_id, pitcher_hand=pitcher_hand,
             start_date=start_date, end_date=end_date, limit=1000)
         if not spray_data:
             return jsonify({"success": False, "error": "No spray data found"}), 404
@@ -1499,7 +1906,8 @@ def api_optimize_and_visualize(player_id: str):
         img_b64 = make_plot_with_image(
             df, positions=positions_logical, batter_label=label,
             pitcher_hand="RHP" if pitcher_hand.upper() == "R" else "LHP",
-            background_image_path=bg_path)
+            background_image_path=bg_path,
+            sample_note=_render_sample_note(player_id, contributed))
 
         mgr = OutfieldRegionManager("outfield_region_config.json")
         positions_pixel = {

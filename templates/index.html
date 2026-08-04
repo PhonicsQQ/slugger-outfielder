@@ -279,6 +279,8 @@
       const [pitcherHand, setPitcherHand] = useState("RHP");
       const [imageBase64, setImageBase64] = useState(null);
       const [batterLabel, setBatterLabel] = useState("");
+      // Whether the chart stands on this hitter's whole tracked sample.
+      const [sampleNote, setSampleNote] = useState("");
       const [loading, setLoading] = useState(false);
       const [zoomed, setZoomed] = useState(false);
       const [loadingBatters, setLoadingBatters] = useState(true);
@@ -328,7 +330,10 @@
                 setBatters(data.batters);
                 setPlayerCount(Object.keys(data.batters).length);
               }
-              if (data.ready) {
+              // The probe finishes first and the duplicate-name records only
+              // fold once the identity pass lands, so stopping on `ready`
+              // alone would leave both halves of a pooled hitter listed.
+              if (data.ready && data.merged) {
                 clearInterval(interval);
               }
             })
@@ -397,6 +402,7 @@
         setLoading(true);
         setError(null);
         setImageBase64(null);
+        setSampleNote("");
         setZoomed(false);
         setPdfReady(false);
 
@@ -416,6 +422,7 @@
           .then((data) => {
             if (data.ok) {
               setImageBase64(data.image_base64);
+              setSampleNote(data.sample_note || "");
               setBatterLabel(data.batter_label || batter.label || "");
 
               // Enable PDF download
@@ -643,6 +650,12 @@
                   alt="Spray chart"
                   onClick={() => setZoomed(true)}
                 />
+                {sampleNote && (
+                  <p style={{ fontSize: "12px", color: "#555",
+                              margin: "6px 4px 0" }}>
+                    {sampleNote}
+                  </p>
+                )}
               </div>
             ) : (
               <p className="empty-state">

@@ -40,6 +40,12 @@ EXCLUDE_HIT_TYPES = {"groundball", "bunt"}
 # to appear in the dropdown menu AND to generate a spray chart.
 MIN_QUALIFYING_BALLS = 15
 
+# Page cap for the identity fingerprint fetch. The worst-split hitter in the
+# league carries 535 batted balls, so one 1000-row page covers every record
+# today; the cap only exists so a season that outgrows it reports truncation
+# instead of silently fingerprinting half a career.
+IDENTITY_PAGE_CAP = 5
+
 
 def _normalize_pitch_call(value) -> str:
     """Collapse "InPlay", "in_play", "In Play" → "inplay"."""
@@ -439,6 +445,118 @@ def fetch_batted_balls(player_ids: Optional[List[str]] = None,
 
     log.error(f"fetch_batted_balls failed: {data}")
     return []
+
+
+def probe_player_identity(player_id: str) -> Optional[Dict]:
+    """
+    Fingerprint one batter_id from its own batted balls, for deciding whether
+    two same-name roster records are one human or two.
+
+    Two records sharing a casefolded name are either the same hitter across
+    two stints (a trade, or a feed row that omitted the team) or two different
+    men. Nothing on the roster payload separates them — it carries only name,
+    id, team and a handedness flag that is demonstrably wrong on the very
+    records at issue — so the evidence has to come from the pitch feed:
+
+      games      game_ids the record appears in. One human cannot appear
+                 twice inside one game_id.
+      days       calendar dates, with nulls and any casing of "NaN" dropped —
+                 a bare NaN token decodes to the float, whose str() is "nan".
+                 One human cannot suit up for two clubs on one date.
+      team_code  the sole distinct batter_team_code, or None when the record
+                 spans more than one (or carries none).
+      sides      {"R": (side, purity, n), "L": ...} — the batting side actually
+                 measured against each pitcher hand, so a genuine switch hitter
+                 is compared per platoon rather than on a single dominant side.
+      balls      qualifying outfield balls per pitcher hand, for disclosing how
+                 much evidence sits under a record that could not be pooled.
+
+    Paginates like fetch_player_spray but keeps only the identity fields, and
+    never falls back to the local file — a fingerprint has to describe what the
+    feed actually holds. ``truncated`` is set when IDENTITY_PAGE_CAP is hit and
+    ``error`` when a later page fails; both mean "cannot tell", never "no
+    collision found". Returns None when the first page fails, so a record with
+    no evidence is refused rather than merged on silence.
+    """
+    url = f"{BASE_URL}/pitches"
+    PAGE_SIZE = 1000
+
+    rows: List[Dict] = []
+    page = 1
+    truncated = False
+    error = False
+
+    while page <= IDENTITY_PAGE_CAP:
+        params = {
+            "batter_id": player_id,
+            "limit": PAGE_SIZE,
+            "page": page,
+            "pitch_call": "InPlay",
+        }
+
+        data = _get_with_retry(url, params, max_retries=1)
+
+        if not data or not data.get("success"):
+            log.warning(f"identity: page {page} failed for {player_id}")
+            if not rows:
+                return None
+            error = True
+            break
+
+        page_rows = data.get("data", [])
+        rows.extend(page_rows)
+
+        if len(page_rows) < PAGE_SIZE:
+            break
+
+        page += 1
+    else:
+        truncated = True
+
+    games = frozenset(str(r["game_id"]) for r in rows if r.get("game_id"))
+    days = frozenset(
+        str(r["date"]) for r in rows
+        if r.get("date") and str(r["date"]).lower() != "nan"
+    )
+    codes = {str(r["batter_team_code"]) for r in rows if r.get("batter_team_code")}
+
+    sides: Dict[str, tuple] = {}
+    balls: Dict[str, int] = {}
+    for hand in ("R", "L"):
+        vs_hand = [
+            r for r in rows
+            if _normalize_pitcher_hand(r.get("pitcher_throws")) == hand
+        ]
+        # batter_side carries the same Left/Right vocabulary as pitcher_throws;
+        # "Undefined" and nulls normalise away rather than being counted.
+        counts: Dict[str, int] = {}
+        for r in vs_hand:
+            side = _normalize_pitcher_hand(r.get("batter_side"))
+            if side:
+                counts[side] = counts.get(side, 0) + 1
+        total = sum(counts.values())
+        if total:
+            top = max(counts, key=lambda s: counts[s])
+            sides[hand] = (top, counts[top] / total, total)
+        else:
+            sides[hand] = (None, 0.0, 0)
+        balls[hand] = sum(1 for r in vs_hand if _is_outfield_ball(r))
+
+    log.info(
+        f"identity: {player_id} → {len(rows)} rows, {len(games)} games, "
+        f"team_code={list(codes) if codes else None}, "
+        f"truncated={truncated} error={error}"
+    )
+
+    return {
+        "games": games,
+        "days": days,
+        "team_code": (next(iter(codes)) if len(codes) == 1 else None),
+        "sides": sides,
+        "balls": balls,
+        "truncated": truncated,
+        "error": error,
+    }
 
 
 def probe_player_has_data(player_id: str) -> bool:

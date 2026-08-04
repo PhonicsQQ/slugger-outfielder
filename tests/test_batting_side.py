@@ -111,3 +111,43 @@ def test_two_sided_sample_tolerates_missing_dates():
     )
     assert (app._batting_side_note(undated, "Bates, Austin (S)")
             == " — batting RH (6) / LH (4)")
+
+
+# ── 9. the sample-completeness note never reaches the title or the label ────
+
+def test_sample_note_lands_in_a_footnote_not_the_title(monkeypatch):
+    """The note says whether the chart stands on the hitter's whole tracked
+    sample, and it must stay out of ``batter_label``: _batting_side_note gates
+    on the label ending in "(S)", so appending anything to it would silently
+    kill the switch-hitter disclosure with no error and no failing test.
+    """
+    from matplotlib.axes import Axes
+
+    titles, texts = [], []
+    orig_title, orig_text = Axes.set_title, Axes.text
+
+    def _title(self, label="", *a, **k):
+        titles.append(label)
+        return orig_title(self, label, *a, **k)
+
+    def _text(self, x, y, s="", *a, **k):
+        texts.append(s)
+        return orig_text(self, x, y, s, *a, **k)
+
+    monkeypatch.setattr(Axes, "set_title", _title)
+    monkeypatch.setattr(Axes, "text", _text)
+
+    df = pd.DataFrame({
+        "x": [10.0] * 20, "y": [200.0] * 20,
+        "direction": [-5.0] * 20, "distance": [300.0] * 20,
+        "outcome": ["OUT"] * 20, "batter_side": ["Left"] * 20,
+    })
+    label = "De Aza, Alejandro (S)"
+    note = "sample pooled from 2 roster records"
+
+    app.make_plot_with_image(df, positions=None, batter_label=label,
+                             pitcher_hand="RHP", sample_note=note)
+
+    assert titles == [f"{label} vs RHP" + app._batting_side_note(df, label)]
+    assert note in texts
+    assert note not in titles[0]
