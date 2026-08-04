@@ -139,6 +139,12 @@
       z-index: 1000;
     }
 
+    .sample-note {
+      font-size: 12px;
+      color: #555;
+      margin: 6px 4px 0;
+    }
+
     .status-line {
       font-size: 12px;
       color: #888;
@@ -651,10 +657,7 @@
                   onClick={() => setZoomed(true)}
                 />
                 {sampleNote && (
-                  <p style={{ fontSize: "12px", color: "#555",
-                              margin: "6px 4px 0" }}>
-                    {sampleNote}
-                  </p>
+                  <p className="sample-note">{sampleNote}</p>
                 )}
               </div>
             ) : (
