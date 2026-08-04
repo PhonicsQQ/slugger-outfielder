@@ -313,3 +313,89 @@ def test_unambiguous_entry_carries_no_sample_note():
     (entry,) = app.build_player_dict(records).values()
     assert entry["sample_note"] == ""
     assert entry["merged_ids"] == ["p1"]
+
+
+# ── 12. a record sharing a team key is a record, not a discard ─────────────
+
+def test_same_team_key_duplicate_is_pooled_not_dropped():
+    """The live Abreu, Osvaldo group, 2026-08-04.
+
+    The feed mints a new player_id per stint AND leaves team_name null on ~140
+    records, so two of his stints both arrived team-less and collided on the
+    ('abreu, osvaldo', '') group key. The later one — f784df39, his LARGEST
+    record at 192 tracked balls — was pushed onto the group's discard list,
+    which merged_ids was never built from. The dropdown entry therefore charted
+    81 of his 243 tracked RHP balls, 33%, under a note reading "sample pooled
+    from 2 roster records" that a coach reads as a completeness guarantee.
+
+    The widget's own evidence said all three were one man: _merge_refusal
+    returns None on every pair.
+    """
+    records = [
+        {"player_id": "p-hag", "player_name": "Abreu, Osvaldo",
+         "player_batting_handedness": "Right",
+         "team_name": "Hagerstown Flying Boxcars"},
+        {"player_id": "p-blank-1", "player_name": "Abreu, Osvaldo",
+         "player_batting_handedness": "Right", "team_name": ""},
+        # Same name, same (blank) team key as p-blank-1 — the discarded record.
+        {"player_id": "p-blank-2", "player_name": "Abreu, Osvaldo",
+         "player_batting_handedness": "Right", "team_name": ""},
+    ]
+    identities = {
+        "p-hag": _fp(games=["g-hag"], days=["2024-04-27"], team_code="HAG_FLY",
+                     sides=_one_sided("R"), balls=(31, 15)),
+        "p-blank-1": _fp(games=["g-sta"], days=["2026-05-15"], team_code="STA_YAN",
+                         sides=_one_sided("R"), balls=(50, 16)),
+        "p-blank-2": _fp(games=["g-old"], days=["2025-06-01"], team_code="LAN",
+                         sides=_one_sided("R"), balls=(162, 30)),
+    }
+    (entry,) = app.build_player_dict(records, identities=identities).values()
+
+    assert entry["merged_ids"] == ["p-hag", "p-blank-1", "p-blank-2"]
+    assert entry["sample_note"] == "sample pooled from 3 roster records"
+
+
+def test_same_team_key_duplicate_that_cannot_be_pooled_is_disclosed():
+    """The other half of the same defect: when the evidence refuses, the record
+    must still be visible in the disclosure rather than vanishing.
+
+    Before, a same-team-key duplicate was dropped before any evidence was
+    consulted, so its balls were neither charted nor counted as missing.
+    """
+    records = [
+        {"player_id": "p-1", "player_name": "Roe, Pat",
+         "player_batting_handedness": "Right", "team_name": ""},
+        {"player_id": "p-2", "player_name": "Roe, Pat",
+         "player_batting_handedness": "Right", "team_name": ""},
+    ]
+    identities = {
+        # One game_id in common: two different men, whatever the roster says.
+        "p-1": _fp(games=["g-shared"], sides=_one_sided("R"), balls=(40, 10)),
+        "p-2": _fp(games=["g-shared"], sides=_one_sided("R"), balls=(60, 12)),
+    }
+    (entry,) = app.build_player_dict(records, identities=identities).values()
+
+    # Still ONE dropdown entry — the same-team fold is unchanged — but the
+    # sheet now says what it is missing instead of implying it is whole.
+    assert entry["merged_ids"] == ["p-1"]
+    assert entry["sample_note"] == (
+        "partial sample — 72 more tracked balls under a separate Roe, Pat "
+        "record (no team listed)")
+
+
+def test_same_team_duplicate_without_evidence_still_folds_to_one_entry():
+    """No fingerprints at all (JSON-loader mode, or before the identity pass):
+    the pre-merge dedupe behaviour must be reproduced exactly — one entry, one
+    charted pid — so a cold start never grows the dropdown back.
+    """
+    records = [
+        {"player_id": "p-1", "player_name": "flores, santiago",
+         "player_batting_handedness": "Right", "team_name": "Team A"},
+        {"player_id": "p-2", "player_name": "Flores, Santiago",
+         "player_batting_handedness": "", "team_name": "Team A"},
+    ]
+    (entry,) = app.build_player_dict(records).values()
+    assert entry["label"] == "Flores, Santiago (R)"
+    assert entry["merged_ids"] == ["p-1"]
+    # No fingerprints means no ball counts, so there is nothing to disclose.
+    assert entry["sample_note"] == ""

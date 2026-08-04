@@ -381,6 +381,22 @@ def _last_tracked_day(group: Dict) -> str:
     return max(days) if days else ""
 
 
+def _bucket_records(groups: Dict[Tuple[str, str], Dict],
+                    bucket: List[Tuple[str, str]]) -> List[Dict]:
+    """Every roster record filed under one casefolded name, in roster order.
+
+    A same-team duplicate is a record like any other here. It used to be held
+    only as a pid on its group and never reached the merge, so its tracked balls
+    could neither be pooled into the chart nor disclosed as missing from it.
+    """
+    records: List[Dict] = []
+    for gkey in bucket:
+        group = groups[gkey]
+        records.append(group)
+        records.extend(group["dupes"])
+    return records
+
+
 def _sample_note(members: List[Dict], refused: List[Dict]) -> str:
     """One-line disclosure telling a coach whether the sheet is whole.
 
@@ -453,13 +469,23 @@ def build_player_dict(players: list,
                 "name": name,
                 "hand": hand,
                 "team": team,
-                "dropped": [],
+                "dupes": [],
             }
             order.append(gkey)
             continue
 
-        # Duplicate of an already-seen human on the same team — merge in place.
-        group["dropped"].append(str(pid))
+        # Another record of the same name under the same team key — one dropdown
+        # entry, as before. It is kept as a record rather than a bare pid because
+        # its balls have to be accounted for: the feed leaves team_name null on
+        # ~140 records, so two stints of one hitter both arrive team-less and
+        # collide here, and discarding one used to hide the larger half of his
+        # sample behind a note that read as a completeness guarantee.
+        group["dupes"].append({
+            "pid": pid,
+            "name": name,
+            "hand": hand,
+            "team": team,
+        })
         if _uppercase_count(name) > _uppercase_count(group["name"]):
             group["name"] = name
         group["hand"] = _merge_hand(group["hand"], hand)
@@ -472,9 +498,10 @@ def build_player_dict(players: list,
     fingerprints = identities or {}
     for gkey in order:
         group = groups[gkey]
-        fp = fingerprints.get(str(group["pid"]))
-        group["fp"] = fp
-        group["balls"] = sum(fp["balls"].values()) if fp else 0
+        for record in [group] + group["dupes"]:
+            fp = fingerprints.get(str(record["pid"]))
+            record["fp"] = fp
+            record["balls"] = sum(fp["balls"].values()) if fp else 0
 
     buckets: Dict[str, List[Tuple[str, str]]] = {}
     for gkey in order:
@@ -482,7 +509,11 @@ def build_player_dict(players: list,
 
     merged_bucket: Dict[str, bool] = {}
     for cname, bucket in buckets.items():
-        members = [groups[k] for k in bucket]
+        # Same-team duplicates take part in the bucket decision on the same
+        # terms as everything else. The invariant is unchanged: one refusal
+        # anywhere refuses the whole bucket, because a name proven to cover two
+        # humans can no longer treat "these two never collided" as evidence.
+        members = _bucket_records(groups, bucket)
         refusal = None
         for i, a in enumerate(members):
             for b in members[i + 1:]:
@@ -512,8 +543,7 @@ def build_player_dict(players: list,
     entries: List[Tuple[Tuple[str, str], Dict, List[Dict], List[Dict]]] = []
     for gkey in order:
         cname = gkey[0]
-        bucket = buckets[cname]
-        members = [groups[k] for k in bucket]
+        members = _bucket_records(groups, buckets[cname])
         if merged_bucket[cname]:
             # One entity, emitted at the primary record's position in the list.
             if gkey != primaries[cname]:
@@ -522,6 +552,9 @@ def build_player_dict(players: list,
             pooled = [primary] + [m for m in members if m is not primary]
             entries.append((gkey, primary, pooled, []))
         else:
+            # The bucket refused, so nothing pools — including this group's own
+            # same-team duplicates, which sit in `refused` and are disclosed
+            # rather than silently dropped.
             group = groups[gkey]
             entries.append(
                 (gkey, group, [group], [m for m in members if m is not group]))
@@ -541,11 +574,11 @@ def build_player_dict(players: list,
             if _uppercase_count(m["name"]) > _uppercase_count(name):
                 name = m["name"]
             hand = _merge_hand(hand, m["hand"])
-        if group["dropped"]:
+        if group["dupes"]:
             log.info(
-                "Merged duplicate player record(s) for %s (%s): kept pid %s, "
-                "dropped %s",
-                name, hand, pid, ", ".join(group["dropped"]),
+                "Same-team duplicate record(s) for %s (%s) under pid %s: %s",
+                name, hand, pid,
+                ", ".join(str(d["pid"]) for d in group["dupes"]),
             )
         merged_ids = [str(m["pid"]) for m in pooled]
         if len(merged_ids) > 1:
