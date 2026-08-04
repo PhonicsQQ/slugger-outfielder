@@ -304,6 +304,13 @@ def _merge_hand(existing: str, incoming: str) -> str:
     return existing
 
 
+def _team_qualifier(team: str) -> str:
+    """Suffix that tells two same-name roster records apart in the dropdown.
+    The feed leaves team_name blank on a large slice of records, so say so
+    plainly rather than leaving two identical rows."""
+    return f" — {team}" if team else " — no team listed"
+
+
 def build_player_dict(players: list) -> Dict[str, Dict]:
     """
     Convert a list of player records into the batter dict format used by the
@@ -316,7 +323,10 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
     variant wins the label, handedness merges (populated beats missing, switch
     beats a one-sided L/R), and the first data-bearing player_id is kept as the
     stable id — the probe filter has already dropped non-qualifying pids
-    upstream.
+    upstream. Records that share a name across teams — including a record the
+    feed left without a team — are separate stints with their own spray history
+    and are not merged; their labels carry the team so the dropdown can tell
+    them apart.
     """
     groups: Dict[Tuple[str, str], Dict] = {}
     order: List[Tuple[str, str]] = []
@@ -350,6 +360,12 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
         group["hand"] = _merge_hand(group["hand"], hand)
 
     result: Dict[str, Dict] = {}
+    # Same-name records on different teams are separate stints with their own
+    # spray history, so they stay separate entries and the label carries the
+    # team to tell them apart.
+    name_groups: Dict[str, int] = {}
+    for gkey in order:
+        name_groups[gkey[0]] = name_groups.get(gkey[0], 0) + 1
     for gkey in order:
         group = groups[gkey]
         name, hand, pid = group["name"], group["hand"], group["pid"]
@@ -359,8 +375,11 @@ def build_player_dict(players: list) -> Dict[str, Dict]:
                 "dropped %s",
                 name, hand, pid, ", ".join(group["dropped"]),
             )
+        label = f"{name} ({hand})"
+        if name_groups[gkey[0]] > 1:
+            label += _team_qualifier(group["team"])
         result[str(pid)] = {
-            "label": f"{name} ({hand})",
+            "label": label,
             "batter_name": name,
             "batter_hand": hand,
             "player_id": pid,
@@ -714,6 +733,50 @@ def _find_outcome_col(df: pd.DataFrame) -> str:
     return "outcome"
 
 
+# Measured purity of a (player, pitcher-hand) panel is either >=0.93 or <=0.65 —
+# nothing lands in between — so the threshold sits in an empty band.
+BATTING_SIDE_AGREEMENT = 0.90
+
+
+def _batting_side_note(df: pd.DataFrame, batter_label: str) -> str:
+    """Chart-title suffix naming the side of the plate the hitter swung from.
+
+    A switch hitter bats left against a RHP and right against a LHP, so the
+    vs-RHP and vs-LHP charts already are the two permutations — only the
+    disclosure was missing. The side is read from the batter_side column of the
+    balls actually drawn rather than from the roster handedness, because an "S"
+    tag routinely goes stale when a hitter converts mid-season. A genuinely
+    two-sided sample lists the side he is using now first, so the sheet is not
+    read off a retired swing.
+    """
+    if not batter_label.rstrip().endswith("(S)"):
+        return ""
+    if df.empty or "batter_side" not in df.columns:
+        return ""
+    # Keep the mask index-aligned to df — the date lookup below needs it.
+    sides = df["batter_side"].map(normalize_hand)
+    sides = sides[sides.isin(("L", "R"))]
+    if sides.empty:
+        return ""
+
+    counts = sides.value_counts()
+    if counts.iloc[0] / len(sides) >= BATTING_SIDE_AGREEMENT:
+        return f" — batting {'LH' if counts.index[0] == 'L' else 'RH'}"
+
+    # Genuinely two-sided sample — lead with the most recently used side.
+    order = list(counts.index)
+    if "date" in df.columns:
+        # The feed leaves date unset on some rows, so drop the nulls before
+        # comparing — max() on a mixed str/NaN object column raises TypeError.
+        last = {s: df.loc[sides.index[sides == s], "date"].dropna().max()
+                for s in order}
+        dated = [s for s in order if pd.notna(last[s])]
+        dated.sort(key=lambda s: last[s], reverse=True)
+        order = dated + [s for s in order if pd.isna(last[s])]
+    return " — batting " + " / ".join(
+        f"{'LH' if s == 'L' else 'RH'} ({counts[s]})" for s in order)
+
+
 def make_plot(
     df: pd.DataFrame,
     positions: Optional[Dict[str, Tuple[float, float]]],
@@ -779,7 +842,8 @@ def make_plot(
     ax.set_xlim(40, 260)
     ax.set_ylim(200, 420)
     ax.axis("off")
-    ax.set_title(f"{batter_label} vs {pitcher_hand}",
+    ax.set_title(f"{batter_label} vs {pitcher_hand}" +
+                 _batting_side_note(df, batter_label),
                  color="white", fontsize=16, pad=12)
 
     buf = io.BytesIO()
@@ -959,7 +1023,8 @@ def make_plot_with_image(
     ], loc="upper right", framealpha=0.9, fontsize=10)
 
     ax.axis("off")
-    ax.set_title(f"{batter_label} vs {pitcher_hand}",
+    ax.set_title(f"{batter_label} vs {pitcher_hand}" +
+                 _batting_side_note(df, batter_label),
                  color="black", fontsize=16, pad=12, weight="bold")
     ax.set_xticks([])
     ax.set_yticks([])

@@ -103,6 +103,92 @@ def test_same_name_different_teams_not_merged():
     assert {"p1", "p2"} == set(result)
 
 
+# ── Same-name records stay separate but self-describing ──────────────────
+
+def test_duplicate_name_labels_carry_team():
+    records = [
+        {"player_id": "p1", "player_name": "Smith, John",
+         "player_batting_handedness": "Right", "team_name": "Team A"},
+        {"player_id": "p2", "player_name": "Smith, John",
+         "player_batting_handedness": "Left", "team_name": "Team B"},
+    ]
+    result = app.build_player_dict(records)
+    assert len(result) == 2
+    assert result["p1"]["label"] == "Smith, John (R) — Team A"
+    assert result["p2"]["label"] == "Smith, John (L) — Team B"
+
+
+def test_unique_name_label_is_not_qualified():
+    records = [
+        {"player_id": "p1", "player_name": "Doe, Jane",
+         "player_batting_handedness": "Right", "team_name": "Team A"},
+    ]
+    result = app.build_player_dict(records)
+    assert result["p1"]["label"] == "Doe, Jane (R)"
+
+
+def test_case_variant_merge_label_unqualified():
+    pid_a, pid_b = "pid-bates-A", "pid-bates-B"
+    records = [
+        {"player_id": pid_a, "player_name": "Bates, Austin",
+         "player_batting_handedness": "Right", "team_name": "Test Team"},
+        {"player_id": pid_b, "player_name": "bates, austin",
+         "player_batting_handedness": "Switch", "team_name": "Test Team"},
+    ]
+    result = app.build_player_dict(records)
+    # The case-variant merge collapses to one group, so it takes no qualifier.
+    assert len(result) == 1
+    assert result[pid_a]["label"] == "Bates, Austin (S)"
+
+
+def test_traded_player_same_name_two_teams_stays_split():
+    records = [
+        {"player_id": "p-arocho-york", "player_name": "Arocho, Jeremy",
+         "player_batting_handedness": "Switch", "team_name": "York Revolution"},
+        {"player_id": "p-arocho-lan", "player_name": "Arocho, Jeremy",
+         "player_batting_handedness": "Switch", "team_name": "Lancaster Stormers"},
+        {"player_id": "p-deaza-smd", "player_name": "De Aza, Alejandro",
+         "player_batting_handedness": "Switch",
+         "team_name": "Southern Maryland Blue Crabs"},
+        {"player_id": "p-deaza-sta", "player_name": "De Aza, Alejandro",
+         "player_batting_handedness": "Left",
+         "team_name": "Staten Island FerryHawks"},
+    ]
+    result = app.build_player_dict(records)
+    assert len(result) == 4
+    assert {"p-arocho-york", "p-arocho-lan",
+            "p-deaza-smd", "p-deaza-sta"} == set(result)
+    assert result["p-arocho-york"]["team_name"] == "York Revolution"
+    assert result["p-arocho-lan"]["team_name"] == "Lancaster Stormers"
+    assert result["p-deaza-smd"]["team_name"] == "Southern Maryland Blue Crabs"
+    assert result["p-deaza-sta"]["team_name"] == "Staten Island FerryHawks"
+    # Same name, same hand — only the team suffix tells the two rows apart.
+    assert result["p-arocho-york"]["label"] != result["p-arocho-lan"]["label"]
+    assert result["p-arocho-york"]["label"].endswith(" — York Revolution")
+    assert result["p-arocho-lan"]["label"].endswith(" — Lancaster Stormers")
+
+
+def test_blank_team_record_is_not_merged_into_its_rostered_twin():
+    # Folding a blank-team record into its rostered twin costs the player his
+    # spray history: measured over the live payload it makes 7 players render
+    # nothing at all (both hands fall under MIN_QUALIFYING_BALLS).
+    records = [
+        {"player_id": "pid-blank", "player_name": "Blackwell, Benjamin",
+         "player_batting_handedness": "Switch", "team_name": ""},
+        {"player_id": "pid-york", "player_name": "Blackwell, Benjamin",
+         "player_batting_handedness": "Right", "team_name": "York Revolution"},
+    ]
+    result = app.build_player_dict(records)
+    assert len(result) == 2
+    assert {"pid-blank", "pid-york"} == set(result)
+    assert result["pid-blank"]["batter_hand"] == "S"
+    assert result["pid-york"]["batter_hand"] == "R"
+    assert result["pid-blank"]["label"] == \
+        "Blackwell, Benjamin (S) — no team listed"
+    assert result["pid-york"]["label"] == \
+        "Blackwell, Benjamin (R) — York Revolution"
+
+
 # ── Fallback constant shape is untouched ─────────────────────────────────
 
 def test_fallback_batters_shape_unchanged():

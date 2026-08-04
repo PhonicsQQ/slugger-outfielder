@@ -342,11 +342,13 @@
         return () => clearInterval(interval);
       }, []);
 
-      // Team an entry belongs to. Fallback / hardcoded batters carry no
-      // team_name, so they group under "Other".
+      const NO_TEAM = "No Team Listed";
+
+      // Team an entry belongs to. Fallback / hardcoded batters, and any record
+      // the feed left without a team, group under NO_TEAM.
       const teamOf = (id) => {
         const t = batters[id] && batters[id].team_name;
-        return t ? t : "Other";
+        return t ? t : NO_TEAM;
       };
 
       const sortedBatterIds = Object.keys(batters).sort((a, b) => {
@@ -355,10 +357,11 @@
         return la.localeCompare(lb);
       });
 
-      // "All Teams" first, then the distinct team names alphabetically.
+      // "All Teams" first, then the distinct team names alphabetically, with
+      // the no-team bucket pinned last.
       const teamOptions = ["All Teams"].concat(
         Array.from(new Set(sortedBatterIds.map(teamOf))).sort((a, b) =>
-          a.localeCompare(b)
+          a === NO_TEAM ? 1 : b === NO_TEAM ? -1 : a.localeCompare(b)
         )
       );
 
