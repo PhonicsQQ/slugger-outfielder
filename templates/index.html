@@ -394,14 +394,54 @@
       // Keep the batter selection valid: if the current pick is filtered out
       // (team change or list refresh), auto-select the first in the filtered
       // list — mirrors the initial auto-select-first behavior.
+      //
+      // A pick can also vanish because the identity pass finished and folded it
+      // into a pooled entry. Jumping to the alphabetically first player in the
+      // league is wrong there: the chart, its label and the Print PDF button all
+      // still point at the old pid, so the dropdown would name one hitter while
+      // the sheet on screen — and the file that button downloads — describe
+      // another. Follow the fold to the entry that now carries the pid, and if
+      // there is no successor, drop the rendered chart rather than leave it
+      // captioned with someone else's name.
       useEffect(() => {
         if (
-          filteredBatterIds.length > 0 &&
-          !filteredBatterIds.includes(selectedBatter)
+          filteredBatterIds.length === 0 ||
+          filteredBatterIds.includes(selectedBatter)
         ) {
-          setSelectedBatter(filteredBatterIds[0]);
+          return;
         }
+        const foldedInto = (id) =>
+          ((batters[id] && batters[id].merged_ids) || []).includes(selectedBatter);
+        const successor = selectedBatter
+          ? filteredBatterIds.find(foldedInto) || Object.keys(batters).find(foldedInto)
+          : null;
+        if (successor && !filteredBatterIds.includes(successor)) {
+          // A pooled entry is filed under the club the hitter actually plays
+          // for, so following the fold can cross the team filter. Widen the
+          // filter rather than abandon the hitter the coach picked.
+          setSelectedTeam("All Teams");
+        }
+        setSelectedBatter(successor || filteredBatterIds[0]);
       }, [selectedTeam, batters, selectedBatter]);
+
+      // A chart is only as good as the record it was drawn from. If that pid is
+      // no longer an entry at all — folded into a pooled one by the identity
+      // pass — then what is on screen is a pre-merge sample while /api/pdf for
+      // the same pid now resolves through the pooled union, so the button would
+      // hand over a file built from more records than the chart above it. Drop
+      // the rendered state and make the coach re-generate. Being filtered out by
+      // the team selector is NOT this case: the entry still exists.
+      useEffect(() => {
+        if (!computedBatterId || loadingBatters) return;
+        if (Object.keys(batters).length === 0) return;
+        if (batters[computedBatterId]) return;
+        setImageBase64(null);
+        setBatterLabel("");
+        setSampleNote("");
+        setPdfReady(false);
+        setComputedBatterId(null);
+        setZoomed(false);
+      }, [batters]);
 
       const handleGenerate = () => {
         if (!selectedBatter) return;
