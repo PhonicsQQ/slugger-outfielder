@@ -233,13 +233,12 @@ try:
 except ImportError:
     pass
 
-# Excel-based optimizer
-USE_EXCEL_ALGORITHM = False
-try:
-    from optimizer import optimize_outfield_excel
-    USE_EXCEL_ALGORITHM = True
-except ImportError:
-    pass
+# optimizer.optimize_outfield_excel is deliberately NOT imported here. Its only
+# consumer was /api/optimize, which never executed successfully, so the Excel
+# algorithm has never placed a fielder in production and is not validated
+# against the charts that ship. It stays in optimizer.py as the reference
+# implementation; anything reviving it needs to reconcile it with
+# compute_raw_positions first.
 
 log.info("=" * 60)
 log.info("Data mode: %s",
@@ -1890,79 +1889,16 @@ def api_player_spray(player_id: str):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/api/optimize/<player_id>", methods=["GET", "POST"])
-def api_optimize_and_visualize(player_id: str):
-    """Full optimization pipeline via the API adapter."""
-    err = _require_api_adapter()
-    if err:
-        return err
-    try:
-        if request.method == "POST":
-            payload = request.get_json(force=True) or {}
-            pitcher_hand = payload.get("pitcher_hand", "R")
-            start_date = payload.get("start_date")
-            end_date = payload.get("end_date")
-            bg_path = payload.get("background_image_path", DEFAULT_BACKGROUND)
-        else:
-            pitcher_hand = request.args.get("pitcher_hand", "R")
-            start_date = request.args.get("start_date")
-            end_date = request.args.get("end_date")
-            bg_path = request.args.get("background_image_path", DEFAULT_BACKGROUND)
-
-        spray_data, contributed = _fetch_union_spray(
-            player_id, pitcher_hand=pitcher_hand,
-            start_date=start_date, end_date=end_date, limit=1000)
-        if not spray_data:
-            return jsonify({"success": False, "error": "No spray data found"}), 404
-
-        from data_loader import parse_spray_to_dataframe
-        df = parse_spray_to_dataframe(spray_data)
-        if df.empty:
-            return jsonify({"success": False, "error": "Failed to parse spray data"}), 400
-
-        df = df.dropna(subset=["x", "y", "hang_time"])
-        if len(df) < MIN_QUALIFYING_BALLS:
-            return jsonify({
-                "success": False,
-                "error": f"Insufficient data: {len(df)} rows (need {MIN_QUALIFYING_BALLS})"
-            }), 400
-
-        from mlb_to_logical_converter import convert_dataframe_mlb_to_logical
-        from excel_grid_to_logical_converter import convert_optimizer_positions_to_logical
-        from outfield_region import OutfieldRegionManager
-
-        df_logical = convert_dataframe_mlb_to_logical(df, mlb_x_col="x", mlb_y_col="y")
-        positions_logical = convert_optimizer_positions_to_logical(
-            optimize_outfield_excel(df_logical))
-
-        label = f"Player {player_id[:8]}"
-        img_b64 = make_plot_with_image(
-            df, positions=positions_logical, batter_label=label,
-            pitcher_hand="RHP" if pitcher_hand.upper() == "R" else "LHP",
-            background_image_path=bg_path,
-            sample_note=_render_sample_note(player_id, contributed))
-
-        mgr = OutfieldRegionManager("outfield_region_config.json")
-        positions_pixel = {
-            n: (float(mgr.logical_to_pixel((lx, ly))[0]),
-                float(mgr.logical_to_pixel((lx, ly))[1]))
-            for n, (lx, ly) in positions_logical.items()
-        }
-
-        return jsonify({
-            "success": True,
-            "image_base64": img_b64,
-            "positions": positions_pixel,
-            "positions_logical": {k: (float(v[0]), float(v[1]))
-                                  for k, v in positions_logical.items()},
-            "data_count": len(df),
-            "batter_label": label,
-            "player_id": player_id,
-            "pitcher_hand": pitcher_hand,
-        })
-    except Exception as e:
-        log.exception("api_optimize_and_visualize failed")
-        return jsonify({"success": False, "error": str(e)}), 500
+# /api/optimize/<player_id> lived here and was removed on 2026-08-04. It had
+# returned 500 on every call it ever received — it imported
+# convert_dataframe_mlb_to_logical from mlb_to_logical_converter, a module that
+# is a stale copy of data_loader.py and exports no such name — so no caller can
+# depend on its success behaviour. Repairing it meant reviving
+# optimize_outfield_excel, a second positioning algorithm that has likewise
+# never run in production: the charts coaches read are placed by
+# compute_raw_positions + compute_constrained_positions in pixel space. One
+# service answering "where should my outfielders stand" two different ways is
+# worse than one answering it once. Positioning is served by /api/compute.
 
 
 # ═════════════════════════════════════════════════════════
