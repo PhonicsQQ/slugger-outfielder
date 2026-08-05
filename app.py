@@ -1969,6 +1969,28 @@ def api_optimize_and_visualize(player_id: str):
 #  PDF SCOUTING REPORT
 # ═════════════════════════════════════════════════════════
 
+def _wrap_pdf_text(c, text: str, max_width: float,
+                   font: str, size: float) -> List[str]:
+    """Break ``text`` into lines that fit ``max_width`` at the given font.
+
+    Measured with the canvas's own metrics rather than a character count, since
+    the notes carry team names of very different widths.
+    """
+    words = text.split()
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and c.stringWidth(candidate, font, size) > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
 def _draw_player_report_page(c, page_w, page_h, batter_id,
                              client_name=None, client_hand=None,
                              img_format="png"):
@@ -2007,6 +2029,23 @@ def _draw_player_report_page(c, page_w, page_h, batter_id,
     # Chart layout
     header_bottom = page_h - 46
     gap = 8
+
+    # The sample disclosure gets its own text line rather than riding along in
+    # the chart bitmap. matplotlib draws it at 7pt into a 2340px-wide image that
+    # this page scales by ~0.23 to fit, which lands it at about 3.3pt of grey
+    # over a dark ballpark photo — present, and unreadable. The printed sheet is
+    # the artifact a coach carries onto the field, so a chart standing on part of
+    # a hitter's tracked balls has to say so legibly there, not only in the UI.
+    note = _sample_notes.get(str(batter_id), "")
+    if note:
+        c.setFont("Helvetica-Oblique", 9)
+        c.setFillColorRGB(0.25, 0.25, 0.25)
+        for line in _wrap_pdf_text(c, note, page_w - 2 * margin,
+                                   "Helvetica-Oblique", 9):
+            header_bottom -= 11
+            c.drawCentredString(page_w / 2, header_bottom, line)
+        c.setFillColorRGB(0, 0, 0)
+        header_bottom -= 4
     chart_w = page_w - 2 * margin
     chart_h = (header_bottom - margin - gap) / 2
 

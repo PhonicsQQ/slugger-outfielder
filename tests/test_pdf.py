@@ -213,3 +213,68 @@ def test_pdf_download_name_unchanged_for_merged_entry(client, monkeypatch):
     assert resp.status_code == 200
     assert "SLUGGER_Test_Player_report.pdf" in \
         resp.headers.get("Content-Disposition", "")
+
+
+# ── 9. the sample disclosure survives into the printed sheet ───────────────
+
+def _page_text(pdf_bytes):
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    return " ".join(" ".join(p.extract_text().split()) for p in reader.pages)
+
+
+def _font_sizes(pdf_bytes):
+    import re
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    raw = reader.pages[0].get_contents().get_data().decode("latin-1")
+    return {float(s) for s in re.findall(r"/F\d+\s+([\d.]+)\s+Tf", raw)}
+
+
+def test_sample_note_is_pdf_text_not_a_3pt_smear(client, monkeypatch):
+    """matplotlib draws the note at 7pt into a 2340px-wide chart that the page
+    scales by ~0.23, i.e. ~3.3pt of grey over a dark ballpark photo. The printed
+    sheet is what a coach carries onto the field, so a chart standing on part of
+    a hitter's tracked balls has to disclose that legibly there too.
+    """
+    note = ("partial sample — 232 more tracked balls under separate "
+            "McCarthy, Ryan records (High Point Rockers, "
+            "Southern Maryland Blue Crabs)")
+    monkeypatch.setattr(app, "_sample_notes", {"mccarthy": note})
+    monkeypatch.setattr(app, "load_spray_and_render", _stub_render(_png_b64()))
+
+    resp = client.get("/api/pdf/mccarthy")
+    assert resp.status_code == 200
+
+    text = _page_text(resp.data)
+    for fragment in ("partial sample", "232 more tracked balls", "McCarthy",
+                     "High Point Rockers"):
+        assert fragment in text, f"{fragment!r} missing from the PDF text layer"
+    assert 9.0 in _font_sizes(resp.data)
+
+
+def test_whole_sample_prints_no_note(client, monkeypatch):
+    monkeypatch.setattr(app, "_sample_notes", {"whole": ""})
+    monkeypatch.setattr(app, "load_spray_and_render", _stub_render(_png_b64()))
+    resp = client.get("/api/pdf/whole")
+    assert resp.status_code == 200
+    assert "sample" not in _page_text(resp.data).lower()
+
+
+def test_long_note_wraps_instead_of_running_off_the_page(client, monkeypatch):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas as pdfcanvas
+
+    note = ("partial sample — 999 more tracked balls under separate "
+            "Vanderbilt-Montgomery, Bartholomew records (Southern Maryland "
+            "Blue Crabs, Hagerstown Flying Boxcars, Charleston Dirty Birds, "
+            "Gastonia Ghost Peppers)")
+    c = pdfcanvas.Canvas(io.BytesIO(), pagesize=letter)
+    page_w = letter[0]
+    lines = app._wrap_pdf_text(c, note, page_w - 48, "Helvetica-Oblique", 9)
+
+    assert len(lines) > 1
+    for line in lines:
+        assert c.stringWidth(line, "Helvetica-Oblique", 9) <= page_w - 48
+    # No word is lost or duplicated by the wrap.
+    assert " ".join(lines) == note
