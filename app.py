@@ -1068,7 +1068,11 @@ def make_plot(
                  color="white", fontsize=16, pad=12)
 
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
+    # fig.savefig, never plt.savefig: pyplot saves the *current* figure, which is
+    # process-global. The worker runs 4 threads, so a second render starting
+    # between this figure's creation and its save would be the one written here —
+    # a chart of a different hitter, returned ok:true under this hitter's name.
+    fig.savefig(buf, format="png", bbox_inches="tight")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
@@ -1261,7 +1265,8 @@ def make_plot_with_image(
     ax.set_yticks([])
 
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=dpi, facecolor="white",
+    # Bound to this figure, not to pyplot's global current figure — see make_plot.
+    fig.savefig(buf, format="png", dpi=dpi, facecolor="white",
                 edgecolor="none", bbox_inches=None, pad_inches=0)
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -1284,11 +1289,23 @@ def _spray_signature(row: Dict) -> Tuple:
     return tuple(row.get(f) for f in _SPRAY_SIGNATURE_FIELDS)
 
 
+def _pool_for(batter_id: str) -> List[str]:
+    """The roster records this chart pools, read once.
+
+    The identity pass republishes ``_union_ids`` mid-flight, and the fetch below
+    takes seconds. Reading the pool separately in the fetch and again in the
+    disclosure let one render describe a pool it never drew from.
+    """
+    return _union_ids.get(str(batter_id), [str(batter_id)])
+
+
 def _fetch_union_spray(batter_id: str,
                        pitcher_hand: Optional[str] = None,
                        start_date: Optional[str] = None,
                        end_date: Optional[str] = None,
-                       limit: int = 1000) -> Tuple[List[Dict], List[str]]:
+                       limit: int = 1000,
+                       pool_ids: Optional[List[str]] = None,
+                       ) -> Tuple[List[Dict], List[str]]:
     """
     Fetch spray data for every roster record proven to be this hitter.
 
@@ -1304,7 +1321,8 @@ def _fetch_union_spray(batter_id: str,
     returned nothing, so the caller can disclose a partial pool rather than
     quietly showing one again.
     """
-    ids = _union_ids.get(str(batter_id), [str(batter_id)])
+    ids = pool_ids if pool_ids is not None else _union_ids.get(
+        str(batter_id), [str(batter_id)])
 
     rows: List[Dict] = []
     contributed: List[str] = []
@@ -1334,11 +1352,17 @@ def _fetch_union_spray(batter_id: str,
     return rows, contributed
 
 
-def _render_sample_note(batter_id: str, contributed: List[str]) -> str:
+def _render_sample_note(batter_id: str, contributed: List[str],
+                        pool_ids: Optional[List[str]] = None) -> str:
     """Disclosure for one rendered chart: what the entry claims, plus whatever
-    the pool actually failed to load on this render."""
+    the pool actually failed to load on this render.
+
+    ``pool_ids`` is the pool the fetch actually used. Without it this re-reads
+    ``_union_ids``, which the identity pass may have replaced since — the note
+    would then be counting records the chart was never asked to draw.
+    """
     note = _sample_notes.get(str(batter_id), "")
-    ids = _union_ids.get(str(batter_id), [str(batter_id)])
+    ids = pool_ids if pool_ids is not None else _pool_for(batter_id)
     missing = [i for i in ids if i not in contributed]
     if missing:
         short = f"{len(missing)} pooled record(s) could not be loaded"
@@ -1365,10 +1389,12 @@ def load_spray_and_render(
     # ── API adapter mode ──
     if USE_API_ADAPTER and not USE_JSON_LOADER:
         pitcher_letter = pitcher_hand_label.replace("HP", "").upper()
+        # One read of the pool for both the fetch and the disclosure.
+        pool_ids = _pool_for(batter_id)
         spray_data, contributed = _fetch_union_spray(
             batter_id, pitcher_hand=pitcher_letter,
-            start_date=None, end_date=None, limit=1000)
-        sample_note = _render_sample_note(batter_id, contributed)
+            start_date=None, end_date=None, limit=1000, pool_ids=pool_ids)
+        sample_note = _render_sample_note(batter_id, contributed, pool_ids)
 
         if not spray_data:
             return None, f"No spray data for {pitcher_hand_label}"
@@ -1454,6 +1480,12 @@ _sample_notes: Dict[str, str] = {}
 # final once this is set, so the frontend must not stop polling on _cache_ready.
 _merge_ready: bool = False
 
+# One warm-up per container. Two requests arriving inside the same cold window
+# both used to pass the callers' `not _cache_ready and not _players_with_data_cache`
+# check — see _start_background_probe.
+_probe_lock = threading.Lock()
+_probe_started: bool = False
+
 
 def _probe_one_player(player_id: str) -> bool:
     try:
@@ -1464,11 +1496,26 @@ def _probe_one_player(player_id: str) -> bool:
 
 
 def _start_background_probe(players: list) -> None:
-    """Probe players for qualifying data in a background thread."""
+    """Probe players for qualifying data in a background thread.
+
+    Idempotent, and deliberately so. Callers gate on
+    ``not _cache_ready and not _players_with_data_cache``, which stays false for
+    the ~0.5s before the first probe result is recorded — and a cold page load
+    makes two requests inside that window (``/`` renders the template, then the
+    React app fetches ``/api/batters``). Both passed the gate, so every cold
+    container ran the 2072-player probe twice: double the upstream calls for the
+    whole warm-up, then two identity passes racing to publish the same pools.
+    """
+    global _probe_started
+    with _probe_lock:
+        if _probe_started:
+            return
+        _probe_started = True
+
     batch = players[:5000]
 
     def run():
-        global _players_with_data_cache, _cache_ready
+        global _players_with_data_cache, _cache_ready, _probe_started
         import time
 
         def probe(player):
@@ -1478,13 +1525,22 @@ def _start_background_probe(players: list) -> None:
             time.sleep(0.5)
             return pid, _probe_one_player(pid)
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            for future in as_completed(
-                {pool.submit(probe, p): p for p in batch}
-            ):
-                pid, result = future.result()
-                if pid:
-                    _players_with_data_cache[pid] = result
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for future in as_completed(
+                    {pool.submit(probe, p): p for p in batch}
+                ):
+                    pid, result = future.result()
+                    if pid:
+                        _players_with_data_cache[pid] = result
+        except Exception:
+            # Release the latch so a later request can retry, exactly as it
+            # could before this pass became once-per-container. A probe that
+            # dies here leaves _cache_ready False and the roster unfiltered.
+            log.exception("Probe pass failed — the next request may retry")
+            with _probe_lock:
+                _probe_started = False
+            return
 
         _cache_ready = True
         found = sum(1 for v in _players_with_data_cache.values() if v)
@@ -1721,10 +1777,12 @@ def api_compute():
         # ── API adapter mode ──
         if USE_API_ADAPTER and not USE_JSON_LOADER:
             pitcher_letter = pitcher_hand.replace("HP", "").upper() if pitcher_hand else "R"
+            # One read of the pool for both the fetch and the disclosure.
+            pool_ids = _pool_for(batter_id)
             spray_data, contributed = _fetch_union_spray(
                 batter_id, pitcher_hand=pitcher_letter,
-                start_date=None, end_date=None, limit=1000)
-            sample_note = _render_sample_note(batter_id, contributed)
+                start_date=None, end_date=None, limit=1000, pool_ids=pool_ids)
+            sample_note = _render_sample_note(batter_id, contributed, pool_ids)
 
             if not spray_data:
                 return jsonify({"ok": False, "error": "No spray data available."}), 404
@@ -1832,6 +1890,31 @@ def _require_api_adapter():
     return None
 
 
+class _BadRequest(ValueError):
+    """A client-side error in the query string, not a server fault."""
+
+
+def _int_arg(name: str, default: int) -> int:
+    """Read an integer query parameter, or raise ``_BadRequest``.
+
+    ``int(request.args.get(...))`` sent a mistyped ``?limit=abc`` down the
+    generic 500 path: the caller was told the server had failed, the response
+    body echoed a Python message, and every malformed query logged a full
+    exception — so genuine faults sat in the log next to typos.
+    """
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise _BadRequest(f"{name} must be a whole number (got {raw!r})")
+
+
+def _bad_request(err: _BadRequest):
+    return jsonify({"success": False, "error": str(err)}), 400
+
+
 @app.route("/api/ballparks", methods=["GET"])
 def api_ballparks():
     err = _require_api_adapter()
@@ -1842,10 +1925,12 @@ def api_ballparks():
             ballpark_name=request.args.get("ballpark_name"),
             city=request.args.get("city"),
             state=request.args.get("state"),
-            limit=int(request.args.get("limit", 50)),
-            page=int(request.args.get("page", 1)),
+            limit=_int_arg("limit", 50),
+            page=_int_arg("page", 1),
             order=request.args.get("order", "ASC"))
         return jsonify({"success": True, "data": data, "count": len(data)})
+    except _BadRequest as e:
+        return _bad_request(e)
     except Exception as e:
         log.exception("api_ballparks failed")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1862,10 +1947,12 @@ def api_games():
             team_name=request.args.get("team_name"),
             start_date=request.args.get("start_date"),
             end_date=request.args.get("end_date"),
-            limit=int(request.args.get("limit", 50)),
-            page=int(request.args.get("page", 1)),
+            limit=_int_arg("limit", 50),
+            page=_int_arg("page", 1),
             order=request.args.get("order", "DESC"))
         return jsonify({"success": True, "data": data, "count": len(data)})
+    except _BadRequest as e:
+        return _bad_request(e)
     except Exception as e:
         log.exception("api_games failed")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1882,8 +1969,10 @@ def api_player_spray(player_id: str):
             pitcher_hand=request.args.get("pitcher_hand"),
             start_date=request.args.get("start_date"),
             end_date=request.args.get("end_date"),
-            limit=int(request.args.get("limit", 5000)))
+            limit=_int_arg("limit", 5000))
         return jsonify({"success": True, "data": data, "count": len(data)})
+    except _BadRequest as e:
+        return _bad_request(e)
     except Exception as e:
         log.exception("api_player_spray failed")
         return jsonify({"success": False, "error": str(e)}), 500
